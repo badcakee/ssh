@@ -37,7 +37,14 @@ RELAY_NAMES=()
 RELAY_LISTEN_PORTS=()
 RELAY_TARGET_PORTS=()
 RELAY_DESCRIPTIONS=()
+FORWARD_RULE_NAMES=()
+FORWARD_RULE_LISTEN_SPECS=()
+FORWARD_RULE_TARGET_SPECS=()
+FORWARD_RULE_DESCRIPTIONS=()
+FORWARD_LISTEN_PORT_CHECKS=()
 GAME_PORT_LIST=()
+GAME_PORT_RANGE_LIST=()
+GAME_PORTS_CANONICAL=""
 
 DEFAULT_VPS1_USER="root"
 DEFAULT_VPS2_USER="root"
@@ -86,7 +93,7 @@ Usage:
 
 Roles:
   client   Install the local `cakessh` helper only.
-  vps1     Install WireGuard on VPS1 and, once VPS2's public key is known, install relays.
+  vps1     Install WireGuard on VPS1 and, once VPS2's public key is known, install the TCP forwarder.
   vps2     Install WireGuard on VPS2 so it auto-connects back to VPS1.
   all      Run the VPS1 flow and also install the local `cakessh` helper.
 
@@ -411,6 +418,52 @@ array_contains() {
   return 1
 }
 
+append_game_port_range() {
+  local range_start="$1"
+  local range_end="$2"
+
+  if [[ "${range_start}" == "${range_end}" ]]; then
+    GAME_PORT_RANGE_LIST+=("${range_start}")
+  else
+    GAME_PORT_RANGE_LIST+=("${range_start}-${range_end}")
+  fi
+}
+
+compress_game_ports() {
+  local current_port=""
+  local previous_port=""
+  local range_start=""
+  local sorted_port=""
+  local -a sorted_ports=()
+
+  GAME_PORT_RANGE_LIST=()
+  GAME_PORTS_CANONICAL=""
+
+  while IFS= read -r sorted_port; do
+    [[ -n "${sorted_port}" ]] || continue
+    sorted_ports+=("${sorted_port}")
+  done < <(printf '%s\n' "${GAME_PORT_LIST[@]}" | sort -n)
+
+  ((${#sorted_ports[@]} > 0)) || return 0
+
+  range_start="${sorted_ports[0]}"
+  previous_port="${sorted_ports[0]}"
+
+  for current_port in "${sorted_ports[@]:1}"; do
+    if (( current_port == previous_port + 1 )); then
+      previous_port="${current_port}"
+      continue
+    fi
+
+    append_game_port_range "${range_start}" "${previous_port}"
+    range_start="${current_port}"
+    previous_port="${current_port}"
+  done
+
+  append_game_port_range "${range_start}" "${previous_port}"
+  GAME_PORTS_CANONICAL="$(join_by_comma "${GAME_PORT_RANGE_LIST[@]}")"
+}
+
 normalize_game_ports() {
   local cleaned="${GAME_PORTS_RAW//,/ }"
   local token=""
@@ -444,6 +497,7 @@ normalize_game_ports() {
   done
 
   ((${#GAME_PORT_LIST[@]} > 0)) || fail "At least one game port is required."
+  compress_game_ports
 }
 
 validate_ipv4_basic() {
@@ -571,6 +625,17 @@ ensure_socat_installed() {
   command -v socat >/dev/null 2>&1 || fail "socat installation failed."
 }
 
+ensure_iptables_installed() {
+  if command -v iptables >/dev/null 2>&1; then
+    return 0
+  fi
+
+  info "Installing iptables with apt..."
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y iptables
+  command -v iptables >/dev/null 2>&1 || fail "iptables installation failed."
+}
+
 ensure_wireguard_installed() {
   if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; then
     return 0
@@ -608,6 +673,14 @@ wireguard_private_key_path() {
 wireguard_public_key_path() {
   local node_role="$1"
   printf '%s/%s.publickey' "$(wireguard_state_dir)" "${node_role}"
+}
+
+forwarder_service_name() {
+  printf 'cakessh-forward.service'
+}
+
+forwarder_config_path() {
+  printf '/etc/cakessh/forwarder.env'
 }
 
 generate_local_wireguard_keys() {
@@ -938,6 +1011,76 @@ add_relay() {
   RELAY_DESCRIPTIONS+=("${description}")
 }
 
+validate_port_spec() {
+  local port_spec="$1"
+  local range_start=""
+  local range_end=""
+
+  if [[ "${port_spec}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+    range_start="${BASH_REMATCH[1]}"
+    range_end="${BASH_REMATCH[2]}"
+    validate_port "${range_start}"
+    validate_port "${range_end}"
+    ((range_start <= range_end)) || fail "Invalid port range: ${port_spec}"
+    return 0
+  fi
+
+  validate_port "${port_spec}"
+}
+
+expand_port_spec() {
+  local port_spec="$1"
+  local current_port=""
+  local range_start=""
+  local range_end=""
+
+  if [[ "${port_spec}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+    range_start="${BASH_REMATCH[1]}"
+    range_end="${BASH_REMATCH[2]}"
+    current_port="${range_start}"
+    while ((current_port <= range_end)); do
+      printf '%s\n' "${current_port}"
+      ((current_port++))
+    done
+    return 0
+  fi
+
+  printf '%s\n' "${port_spec}"
+}
+
+iptables_port_spec() {
+  local port_spec="$1"
+  printf '%s' "${port_spec//-/:}"
+}
+
+add_forward_rule() {
+  local name="$1"
+  local listen_spec="$2"
+  local target_spec="$3"
+  local description="$4"
+  local port_check=""
+
+  validate_port_spec "${listen_spec}"
+  validate_port_spec "${target_spec}"
+
+  if [[ "${listen_spec}" == *-* ]] && [[ "${target_spec}" != "${listen_spec}" ]]; then
+    fail "Port range forwarding must use the same listen and target range: ${listen_spec} -> ${target_spec}"
+  fi
+
+  while IFS= read -r port_check; do
+    [[ -n "${port_check}" ]] || continue
+    if array_contains "${port_check}" "${FORWARD_LISTEN_PORT_CHECKS[@]:-}"; then
+      fail "Duplicate public listen port requested: ${port_check}"
+    fi
+    FORWARD_LISTEN_PORT_CHECKS+=("${port_check}")
+  done < <(expand_port_spec "${listen_spec}")
+
+  FORWARD_RULE_NAMES+=("${name}")
+  FORWARD_RULE_LISTEN_SPECS+=("${listen_spec}")
+  FORWARD_RULE_TARGET_SPECS+=("${target_spec}")
+  FORWARD_RULE_DESCRIPTIONS+=("${description}")
+}
+
 stop_existing_relays() {
   disable_relay_instances "Stopping existing relay batch" "no"
 }
@@ -1029,6 +1172,202 @@ disable_relay_instances() {
 build_socat_target_address() {
   local target_port="$1"
   printf 'TCP4:%s:%s' "${WG_VPS2_IP}" "${target_port}"
+}
+
+write_forwarder_runner() {
+  mkdir -p /usr/local/lib/cakessh
+
+  cat > /usr/local/lib/cakessh/cakessh-forwarder <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+action="${1:-up}"
+config_file="/etc/cakessh/forwarder.env"
+
+[[ -f "${config_file}" ]] || {
+  printf 'Missing forwarder config: %s\n' "${config_file}" >&2
+  exit 1
+}
+
+# shellcheck disable=SC1090
+. "${config_file}"
+
+: "${VPS1_IPV4:?VPS1_IPV4 is required}"
+: "${WG_INTERFACE:?WG_INTERFACE is required}"
+: "${WG_VPS2_IP:?WG_VPS2_IP is required}"
+: "${FORWARD_RULE_COUNT:?FORWARD_RULE_COUNT is required}"
+
+IPTABLES_BIN="${IPTABLES_BIN:-$(command -v iptables || true)}"
+SYSCTL_BIN="${SYSCTL_BIN:-$(command -v sysctl || true)}"
+[[ -n "${IPTABLES_BIN}" ]] || {
+  printf 'iptables not found on PATH.\n' >&2
+  exit 1
+}
+[[ -n "${SYSCTL_BIN}" ]] || {
+  printf 'sysctl not found on PATH.\n' >&2
+  exit 1
+}
+
+to_iptables_spec() {
+  local port_spec="$1"
+  printf '%s' "${port_spec//-/:}"
+}
+
+ensure_chain() {
+  local table="$1"
+  local chain="$2"
+
+  "${IPTABLES_BIN}" -t "${table}" -F "${chain}" 2>/dev/null || "${IPTABLES_BIN}" -t "${table}" -N "${chain}"
+}
+
+delete_chain_if_exists() {
+  local table="$1"
+  local chain="$2"
+
+  "${IPTABLES_BIN}" -t "${table}" -F "${chain}" 2>/dev/null || true
+  "${IPTABLES_BIN}" -t "${table}" -X "${chain}" 2>/dev/null || true
+}
+
+ensure_jump() {
+  local table="$1"
+  local parent_chain="$2"
+  local child_chain="$3"
+
+  if ! "${IPTABLES_BIN}" -t "${table}" -C "${parent_chain}" -j "${child_chain}" >/dev/null 2>&1; then
+    "${IPTABLES_BIN}" -t "${table}" -I "${parent_chain}" 1 -j "${child_chain}"
+  fi
+}
+
+delete_jump_if_exists() {
+  local table="$1"
+  local parent_chain="$2"
+  local child_chain="$3"
+
+  while "${IPTABLES_BIN}" -t "${table}" -C "${parent_chain}" -j "${child_chain}" >/dev/null 2>&1; do
+    "${IPTABLES_BIN}" -t "${table}" -D "${parent_chain}" -j "${child_chain}" >/dev/null 2>&1 || true
+  done
+}
+
+remove_rules() {
+  delete_jump_if_exists filter FORWARD CAKESSH_FORWARD
+  delete_jump_if_exists nat POSTROUTING CAKESSH_SNAT
+  delete_jump_if_exists nat PREROUTING CAKESSH_DNAT
+  delete_chain_if_exists filter CAKESSH_FORWARD
+  delete_chain_if_exists nat CAKESSH_SNAT
+  delete_chain_if_exists nat CAKESSH_DNAT
+}
+
+install_rules() {
+  local index=""
+  local rule_var=""
+  local rule_value=""
+  local name=""
+  local listen_spec=""
+  local target_spec=""
+  local description=""
+  local listen_iptables_spec=""
+  local target_iptables_spec=""
+  local target_destination=""
+
+  "${SYSCTL_BIN}" -w net.ipv4.ip_forward=1 >/dev/null
+
+  ensure_chain nat CAKESSH_DNAT
+  ensure_chain nat CAKESSH_SNAT
+  ensure_chain filter CAKESSH_FORWARD
+
+  "${IPTABLES_BIN}" -t filter -A CAKESSH_FORWARD -i "${WG_INTERFACE}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  "${IPTABLES_BIN}" -t nat -A CAKESSH_SNAT -o "${WG_INTERFACE}" -p tcp -d "${WG_VPS2_IP}" -j MASQUERADE
+
+  for ((index = 1; index <= FORWARD_RULE_COUNT; index++)); do
+    rule_var="FORWARD_RULE_${index}"
+    rule_value="${!rule_var:-}"
+    [[ -n "${rule_value}" ]] || continue
+
+    IFS='|' read -r name listen_spec target_spec description <<< "${rule_value}"
+    listen_iptables_spec="$(to_iptables_spec "${listen_spec}")"
+    target_iptables_spec="$(to_iptables_spec "${target_spec}")"
+
+    if [[ "${target_spec}" == *-* ]]; then
+      target_destination="${WG_VPS2_IP}"
+    else
+      target_destination="${WG_VPS2_IP}:${target_spec}"
+    fi
+
+    "${IPTABLES_BIN}" -t nat -A CAKESSH_DNAT -p tcp -d "${VPS1_IPV4}" --dport "${listen_iptables_spec}" -j DNAT --to-destination "${target_destination}"
+    "${IPTABLES_BIN}" -t filter -A CAKESSH_FORWARD -o "${WG_INTERFACE}" -p tcp -d "${WG_VPS2_IP}" --dport "${target_iptables_spec}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+  done
+
+  ensure_jump nat PREROUTING CAKESSH_DNAT
+  ensure_jump nat POSTROUTING CAKESSH_SNAT
+  ensure_jump filter FORWARD CAKESSH_FORWARD
+}
+
+case "${action}" in
+  up)
+    remove_rules || true
+    install_rules
+    ;;
+  down)
+    remove_rules
+    ;;
+  *)
+    printf 'Unsupported action: %s\n' "${action}" >&2
+    exit 1
+    ;;
+esac
+EOF
+
+  chmod 0755 /usr/local/lib/cakessh/cakessh-forwarder
+}
+
+write_forwarder_unit() {
+  cat > /etc/systemd/system/$(forwarder_service_name) <<EOF
+[Unit]
+Description=cakessh TCP forwarder
+After=network-online.target $(wireguard_service_name)
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/cakessh/cakessh-forwarder up
+ExecReload=/usr/local/lib/cakessh/cakessh-forwarder up
+ExecStop=/usr/local/lib/cakessh/cakessh-forwarder down
+RemainAfterExit=yes
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+write_forwarder_config() {
+  local index=""
+  local rule_value=""
+
+  mkdir -p /etc/cakessh
+
+  {
+    printf 'VPS1_IPV4=%q\n' "${VPS1_IPV4}"
+    printf 'WG_INTERFACE=%q\n' "${WG_INTERFACE}"
+    printf 'WG_VPS2_IP=%q\n' "${WG_VPS2_IP}"
+    printf 'FORWARD_RULE_COUNT=%q\n' "${#FORWARD_RULE_NAMES[@]}"
+
+    for index in "${!FORWARD_RULE_NAMES[@]}"; do
+      rule_value="${FORWARD_RULE_NAMES[$index]}|${FORWARD_RULE_LISTEN_SPECS[$index]}|${FORWARD_RULE_TARGET_SPECS[$index]}|${FORWARD_RULE_DESCRIPTIONS[$index]}"
+      printf 'FORWARD_RULE_%s=%q\n' "$((index + 1))" "${rule_value}"
+    done
+  } > "$(forwarder_config_path)"
+
+  chmod 0600 "$(forwarder_config_path)"
+}
+
+upsert_forwarder_service() {
+  local service_name=""
+
+  service_name="$(forwarder_service_name)"
+  systemctl enable --now "${service_name}"
+  systemctl restart "${service_name}"
+  systemctl is-active --quiet "${service_name}" || fail "Forwarder service failed to start: ${service_name}"
 }
 
 write_relay_runner() {
@@ -1125,22 +1464,61 @@ enable_relays() {
   done
 }
 
+forwarded_public_port_specs() {
+  local wings_port=""
+  local -a port_specs=()
+
+  wings_port="$(calc_wings_port)"
+  port_specs+=("${PUBLIC_SSH_FORWARD_PORT}")
+  port_specs+=("${wings_port}")
+  port_specs+=("2022")
+  port_specs+=("${GAME_PORT_RANGE_LIST[@]}")
+  printf '%s\n' "${port_specs[@]}"
+}
+
+forwarded_public_port_specs_csv() {
+  local -a port_specs=()
+  local port_spec=""
+
+  while IFS= read -r port_spec; do
+    [[ -n "${port_spec}" ]] || continue
+    port_specs+=("${port_spec}")
+  done < <(forwarded_public_port_specs)
+
+  join_by_comma "${port_specs[@]}"
+}
+
 configure_ufw() {
-  local port=""
+  local port_spec=""
+  local ufw_port_spec=""
+  local public_port_specs_csv=""
+
+  public_port_specs_csv="$(forwarded_public_port_specs_csv)"
 
   if ! command -v ufw >/dev/null 2>&1; then
-    warn "ufw is not installed. Open these TCP ports manually: $(join_by_comma "${RELAY_LISTEN_PORTS[@]}") and ${WG_PORT}/udp"
+    warn "ufw is not installed. Open these TCP ports manually: ${public_port_specs_csv} and ${WG_PORT}/udp"
     return 0
   fi
 
   if ! ufw status 2>/dev/null | grep -q '^Status: active'; then
-    warn "ufw is not active. Open these TCP ports manually if another firewall is enabled: $(join_by_comma "${RELAY_LISTEN_PORTS[@]}") and ${WG_PORT}/udp"
+    warn "ufw is not active. Open these TCP ports manually if another firewall is enabled: ${public_port_specs_csv} and ${WG_PORT}/udp"
     return 0
   fi
 
   ufw allow "${WG_PORT}/udp" >/dev/null
-  for port in "${RELAY_LISTEN_PORTS[@]}"; do
-    ufw allow "${port}/tcp" >/dev/null
+  while IFS= read -r port_spec; do
+    [[ -n "${port_spec}" ]] || continue
+    ufw_port_spec="$(iptables_port_spec "${port_spec}")"
+    ufw allow "${ufw_port_spec}/tcp" >/dev/null
+  done < <(forwarded_public_port_specs)
+}
+
+validate_vps1_relay_phase() {
+  local listen_port=""
+
+  stop_existing_relays
+  for listen_port in "${FORWARD_LISTEN_PORT_CHECKS[@]}"; do
+    ensure_port_is_free "${listen_port}"
   done
 }
 
@@ -1201,20 +1579,27 @@ prompt_install_inputs() {
 
 prepare_relay_plan() {
   local wings_port=""
-  local game_port=""
+  local game_port_spec=""
+  local game_rule_name=""
 
+  FORWARD_RULE_NAMES=()
+  FORWARD_RULE_LISTEN_SPECS=()
+  FORWARD_RULE_TARGET_SPECS=()
+  FORWARD_RULE_DESCRIPTIONS=()
+  FORWARD_LISTEN_PORT_CHECKS=()
   RELAY_NAMES=()
   RELAY_LISTEN_PORTS=()
   RELAY_TARGET_PORTS=()
   RELAY_DESCRIPTIONS=()
   wings_port="$(calc_wings_port)"
 
-  add_relay "ssh-vps2" "${PUBLIC_SSH_FORWARD_PORT}" "${VPS2_SSH_PORT}" "Direct SSH to VPS2 over WireGuard"
-  add_relay "wings" "${wings_port}" "${wings_port}" "Pterodactyl Wings over WireGuard"
-  add_relay "sftp" "2022" "2022" "Pterodactyl SFTP over WireGuard"
+  add_forward_rule "ssh-vps2" "${PUBLIC_SSH_FORWARD_PORT}" "${VPS2_SSH_PORT}" "Direct SSH to VPS2 over WireGuard"
+  add_forward_rule "wings" "${wings_port}" "${wings_port}" "Pterodactyl Wings over WireGuard"
+  add_forward_rule "sftp" "2022" "2022" "Pterodactyl SFTP over WireGuard"
 
-  for game_port in "${GAME_PORT_LIST[@]}"; do
-    add_relay "game-${game_port}" "${game_port}" "${game_port}" "Minecraft game port ${game_port} over WireGuard"
+  for game_port_spec in "${GAME_PORT_RANGE_LIST[@]}"; do
+    game_rule_name="game-${game_port_spec//[^0-9]/-}"
+    add_forward_rule "${game_rule_name}" "${game_port_spec}" "${game_port_spec}" "Minecraft game ports over WireGuard"
   done
 }
 
@@ -1251,15 +1636,6 @@ validate_vps2_inputs() {
   [[ -n "${WG_VPS1_PUBLIC_KEY}" ]] || fail "VPS2 install requires --wg-vps1-public-key."
 }
 
-validate_vps1_relay_phase() {
-  local listen_port=""
-
-  stop_existing_relays
-  for listen_port in "${RELAY_LISTEN_PORTS[@]}"; do
-    ensure_port_is_free "${listen_port}"
-  done
-}
-
 print_vps1_bootstrap_summary() {
   info ""
   info "VPS1 WireGuard bootstrap complete."
@@ -1271,7 +1647,7 @@ print_vps1_bootstrap_summary() {
   info "  sudo bash install.sh vps2 --vps1-ipv4 ${VPS1_IPV4} --wg-interface ${WG_INTERFACE} --wg-port ${WG_PORT} --wg-vps1-address ${WG_VPS1_ADDRESS} --wg-vps2-address ${WG_VPS2_ADDRESS} --wg-vps1-public-key ${LOCAL_WG_PUBLIC_KEY}"
   info ""
   info "After VPS2 prints its public key, rerun this on VPS1 to finish the relays:"
-  info "  sudo bash install.sh vps1 --vps1-ipv4 ${VPS1_IPV4} --vps2-user ${VPS2_USER} --vps2-ssh-port ${VPS2_SSH_PORT} --public-ssh-port ${PUBLIC_SSH_FORWARD_PORT} --wings-scheme ${WINGS_SCHEME} --game-ports $(join_by_comma "${GAME_PORT_LIST[@]}") --wg-interface ${WG_INTERFACE} --wg-port ${WG_PORT} --wg-vps1-address ${WG_VPS1_ADDRESS} --wg-vps2-address ${WG_VPS2_ADDRESS} --wg-vps2-public-key <PASTE_VPS2_PUBLIC_KEY>"
+  info "  sudo bash install.sh vps1 --vps1-ipv4 ${VPS1_IPV4} --vps2-user ${VPS2_USER} --vps2-ssh-port ${VPS2_SSH_PORT} --public-ssh-port ${PUBLIC_SSH_FORWARD_PORT} --wings-scheme ${WINGS_SCHEME} --game-ports ${GAME_PORTS_CANONICAL} --wg-interface ${WG_INTERFACE} --wg-port ${WG_PORT} --wg-vps1-address ${WG_VPS1_ADDRESS} --wg-vps2-address ${WG_VPS2_ADDRESS} --wg-vps2-public-key <PASTE_VPS2_PUBLIC_KEY>"
   info ""
   info "After that you can use either:"
   info "  cakessh connect"
@@ -1316,13 +1692,13 @@ install_vps1() {
   prepare_relay_plan
   validate_vps1_relay_phase
 
-  progress 4 5 "Installing TCP relays on VPS1"
-  ensure_socat_installed
-  write_relay_runner
-  write_systemd_unit
-  write_relay_envs
+  progress 4 5 "Installing TCP forwarder on VPS1"
+  ensure_iptables_installed
+  write_forwarder_runner
+  write_forwarder_unit
+  write_forwarder_config
   systemctl daemon-reload
-  enable_relays
+  upsert_forwarder_service
   configure_ufw
 
   progress 5 5 "VPS1 setup finished"
@@ -1330,9 +1706,10 @@ install_vps1() {
   first_game_port="${GAME_PORT_LIST[0]}"
 
   info ""
-  info "VPS1 relay install complete."
+  info "VPS1 forwarding install complete."
   info "WireGuard backend: ${WG_VPS2_IP} via ${WG_INTERFACE}"
   info "Autostart enabled: $(wireguard_service_name)"
+  info "Forwarder service: $(forwarder_service_name)"
   info "Direct SSH:"
   info "  ssh -p ${PUBLIC_SSH_FORWARD_PORT} ${VPS2_USER}@${VPS1_IPV4}"
   if [[ "${WINGS_SCHEME}" == "https" ]]; then
@@ -1388,11 +1765,19 @@ remove_client() {
 }
 
 remove_vps1() {
+  local forwarder_service=""
+
   require_root
-  progress 1 3 "Stopping VPS1 relays"
+  forwarder_service="$(forwarder_service_name)"
+
+  progress 1 3 "Stopping VPS1 forwarder and relays"
+  systemctl disable --now "${forwarder_service}" >/dev/null 2>&1 || true
   disable_relay_instances "Stopping relay batch" "yes"
   find /etc/cakessh/relays -mindepth 1 -maxdepth 1 -type f -name '*.env' -delete 2>/dev/null || true
   rm -f -- /etc/cakessh/instances.list
+  rm -f -- "$(forwarder_config_path)"
+  rm -f -- "/etc/systemd/system/${forwarder_service}"
+  rm -f -- /usr/local/lib/cakessh/cakessh-forwarder
   rm -f -- /etc/systemd/system/cakessh-relay@.service
   rm -f -- /usr/local/lib/cakessh/cakessh-relay-runner
   rmdir /etc/cakessh/relays 2>/dev/null || true
@@ -1403,8 +1788,8 @@ remove_vps1() {
   systemctl daemon-reload
 
   progress 3 3 "VPS1 uninstall finished"
-  info "Removed cakessh relay services and WireGuard from VPS1."
-  warn "Firewall rules were left in place. Remove them manually if you no longer need them."
+  info "Removed cakessh forwarder, relay leftovers, and WireGuard from VPS1."
+  warn "Firewall allow rules were left in place. Remove them manually if you no longer need them."
 }
 
 remove_vps2() {
