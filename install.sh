@@ -939,18 +939,91 @@ add_relay() {
 }
 
 stop_existing_relays() {
-  if [[ -f /etc/cakessh/instances.list ]]; then
-    while IFS= read -r instance_name; do
-      [[ -n "${instance_name}" ]] || continue
-      systemctl disable --now "cakessh-relay@${instance_name}.service" >/dev/null 2>&1 || true
-    done < /etc/cakessh/instances.list
-  fi
-
-  remove_relay_symlinks
+  disable_relay_instances "Stopping existing relay batch" "no"
 }
 
 remove_relay_symlinks() {
   find /etc/systemd/system -maxdepth 3 -type l -name 'cakessh-relay@*.service' -delete 2>/dev/null || true
+}
+
+collect_relay_instances() {
+  local output_file="$1"
+  local env_path=""
+  local symlink_path=""
+  local instance_name=""
+
+  : > "${output_file}"
+
+  if [[ -f /etc/cakessh/instances.list ]]; then
+    while IFS= read -r instance_name; do
+      [[ -n "${instance_name}" ]] || continue
+      printf '%s\n' "${instance_name}" >> "${output_file}"
+    done < /etc/cakessh/instances.list
+  fi
+
+  if [[ -d /etc/cakessh/relays ]]; then
+    for env_path in /etc/cakessh/relays/*.env; do
+      [[ -e "${env_path}" ]] || break
+      instance_name="${env_path##*/}"
+      instance_name="${instance_name%.env}"
+      printf '%s\n' "${instance_name}" >> "${output_file}"
+    done
+  fi
+
+  while IFS= read -r symlink_path; do
+    [[ -n "${symlink_path}" ]] || continue
+    instance_name="${symlink_path##*/}"
+    instance_name="${instance_name#cakessh-relay@}"
+    instance_name="${instance_name%.service}"
+    printf '%s\n' "${instance_name}" >> "${output_file}"
+  done < <(find /etc/systemd/system -maxdepth 3 -type l -name 'cakessh-relay@*.service' 2>/dev/null || true)
+
+  sort -u -o "${output_file}" "${output_file}" 2>/dev/null || true
+}
+
+disable_relay_instances() {
+  local progress_label="$1"
+  local remove_env_files="${2:-no}"
+  local relay_file=""
+  local instance_name=""
+  local batch_start=0
+  local batch_size=25
+  local current=0
+  local total=0
+  local -a relay_units=()
+
+  relay_file="$(mktemp)"
+  collect_relay_instances "${relay_file}"
+  total="$(awk 'NF { count++ } END { print count + 0 }' "${relay_file}")"
+
+  if (( total == 0 )); then
+    rm -f -- "${relay_file}"
+    remove_relay_symlinks
+    info "No cakessh relay services found."
+    return 0
+  fi
+
+  info "Found ${total} cakessh relay service(s)."
+
+  while IFS= read -r instance_name; do
+    [[ -n "${instance_name}" ]] || continue
+    relay_units+=("cakessh-relay@${instance_name}.service")
+    current=$((current + 1))
+
+    if [[ "${remove_env_files}" == "yes" ]]; then
+      rm -f -- "/etc/cakessh/relays/${instance_name}.env"
+    fi
+
+    if (( ${#relay_units[@]} >= batch_size || current == total )); then
+      batch_start=$((current - ${#relay_units[@]} + 1))
+      info "  ${progress_label} ${batch_start}-${current}/${total}"
+      systemctl disable --now "${relay_units[@]}" >/dev/null 2>&1 || true
+      relay_units=()
+    fi
+  done < "${relay_file}"
+
+  rm -f -- "${relay_file}"
+  remove_relay_symlinks
 }
 
 build_socat_target_address() {
@@ -1317,16 +1390,7 @@ remove_client() {
 remove_vps1() {
   require_root
   progress 1 3 "Stopping VPS1 relays"
-
-  if [[ -f /etc/cakessh/instances.list ]]; then
-    while IFS= read -r instance_name; do
-      [[ -n "${instance_name}" ]] || continue
-      systemctl disable --now "cakessh-relay@${instance_name}.service" >/dev/null 2>&1 || true
-      rm -f -- "/etc/cakessh/relays/${instance_name}.env"
-    done < /etc/cakessh/instances.list
-  fi
-
-  remove_relay_symlinks
+  disable_relay_instances "Stopping relay batch" "yes"
   find /etc/cakessh/relays -mindepth 1 -maxdepth 1 -type f -name '*.env' -delete 2>/dev/null || true
   rm -f -- /etc/cakessh/instances.list
   rm -f -- /etc/systemd/system/cakessh-relay@.service
