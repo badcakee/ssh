@@ -945,6 +945,12 @@ stop_existing_relays() {
       systemctl disable --now "cakessh-relay@${instance_name}.service" >/dev/null 2>&1 || true
     done < /etc/cakessh/instances.list
   fi
+
+  remove_relay_symlinks
+}
+
+remove_relay_symlinks() {
+  find /etc/systemd/system -maxdepth 3 -type l -name 'cakessh-relay@*.service' -delete 2>/dev/null || true
 }
 
 build_socat_target_address() {
@@ -1320,6 +1326,7 @@ remove_vps1() {
     done < /etc/cakessh/instances.list
   fi
 
+  remove_relay_symlinks
   find /etc/cakessh/relays -mindepth 1 -maxdepth 1 -type f -name '*.env' -delete 2>/dev/null || true
   rm -f -- /etc/cakessh/instances.list
   rm -f -- /etc/systemd/system/cakessh-relay@.service
