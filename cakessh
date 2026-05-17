@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="cakessh"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cakessh"
+CONFIG_FILE="${CONFIG_DIR}/client.env"
+
+fail() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+print_help() {
+  cat <<'EOF'
+cakessh
+
+Usage:
+  cakessh connect [-i /path/to/key] [-- remote command]
+  cakessh direct [-i /path/to/key] [-- remote command]
+  cakessh status
+  cakessh uninstall
+  cakessh help
+
+Commands:
+  connect     Connect to VPS2 through VPS1, or directly when run on VPS1.
+  direct      Connect to VPS2 through VPS1's public IP and forwarded SSH port.
+  status      Show the saved configuration and local checks.
+  uninstall   Remove the local cakessh helper and config.
+  help        Show this help text.
+EOF
+}
+
+print_connect_help() {
+  cat <<'EOF'
+Usage:
+  cakessh connect [-i /path/to/key] [-- remote command]
+  cakessh direct [-i /path/to/key] [-- remote command]
+
+Examples:
+  cakessh connect
+  cakessh direct
+  cakessh connect -i ~/.ssh/id_ed25519
+  cakessh connect -- hostname
+EOF
+}
+
+require_ssh() {
+  command -v ssh >/dev/null 2>&1 || fail "OpenSSH client not found. Install ssh first."
+}
+
+local_has_ipv4() {
+  local target_ip="$1"
+
+  if command -v ip >/dev/null 2>&1; then
+    ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "${target_ip}"
+    return
+  fi
+
+  if command -v hostname >/dev/null 2>&1; then
+    hostname -I 2>/dev/null | tr ' ' '\n' | grep -Fxq "${target_ip}"
+    return
+  fi
+
+  return 1
+}
+
+load_config() {
+  [[ -f "${CONFIG_FILE}" ]] || fail "Missing config file: ${CONFIG_FILE}. Run bash install.sh client first."
+
+  # shellcheck disable=SC1090
+  . "${CONFIG_FILE}"
+
+  : "${CAKESSH_VPS1_IPV4:?Missing CAKESSH_VPS1_IPV4 in ${CONFIG_FILE}}"
+  : "${CAKESSH_VPS1_USER:?Missing CAKESSH_VPS1_USER in ${CONFIG_FILE}}"
+  CAKESSH_VPS2_HOST="${CAKESSH_VPS2_HOST:-${CAKESSH_VPS2_IPV6:-}}"
+  : "${CAKESSH_VPS2_HOST:?Missing CAKESSH_VPS2_HOST in ${CONFIG_FILE}}"
+  : "${CAKESSH_VPS2_USER:?Missing CAKESSH_VPS2_USER in ${CONFIG_FILE}}"
+}
+
+format_ssh_host() {
+  local host="$1"
+
+  if [[ "${host}" == \[*\] ]]; then
+    printf '%s' "${host}"
+  elif [[ "${host}" == *:* ]]; then
+    printf '[%s]' "${host}"
+  else
+    printf '%s' "${host}"
+  fi
+}
+
+show_status() {
+  require_ssh
+
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    printf 'Config file: %s (missing)\n' "${CONFIG_FILE}"
+    printf 'Run `bash install.sh client` first.\n'
+    return 1
+  fi
+
+  load_config
+
+  printf 'Config file: %s\n' "${CONFIG_FILE}"
+  printf 'Helper path: %s\n' "$(command -v cakessh || printf 'not in PATH')"
+  printf 'Jump host: %s@%s:%s\n' \
+    "${CAKESSH_VPS1_USER}" \
+    "${CAKESSH_VPS1_IPV4}" \
+    "${CAKESSH_VPS1_SSH_PORT:-22}"
+  printf 'Target host: %s@%s:%s\n' \
+    "${CAKESSH_VPS2_USER}" \
+    "$(format_ssh_host "${CAKESSH_VPS2_HOST}")" \
+    "${CAKESSH_VPS2_SSH_PORT:-22}"
+
+  if [[ -n "${CAKESSH_IDENTITY_FILE:-}" ]]; then
+    if [[ -f "${CAKESSH_IDENTITY_FILE}" ]]; then
+      printf 'Identity file: %s\n' "${CAKESSH_IDENTITY_FILE}"
+    else
+      printf 'Identity file: %s (missing on disk)\n' "${CAKESSH_IDENTITY_FILE}"
+    fi
+  else
+    printf 'Identity file: not configured\n'
+  fi
+
+  printf 'Public SSH relay port on VPS1: %s\n' "${CAKESSH_PUBLIC_SSH_FORWARD_PORT:-not configured}"
+  printf 'Wings public port: %s\n' "${CAKESSH_WINGS_PUBLIC_PORT:-not configured}"
+  printf 'Game ports: %s\n' "${CAKESSH_GAME_PORTS:-not configured}"
+  printf 'WireGuard interface: %s\n' "${CAKESSH_WG_INTERFACE:-not configured}"
+  printf 'SSH aliases: %s, %s\n' "cakessh-vps2" "cakessh-vps2-port"
+}
+
+parse_identity_and_remote_command() {
+  local default_identity_file="${CAKESSH_IDENTITY_FILE:-}"
+  local current_identity_file="${default_identity_file}"
+  PARSED_REMOTE_COMMAND=()
+
+  while (($# > 0)); do
+    case "$1" in
+      -i|--identity-file)
+        [[ $# -ge 2 ]] || fail "Missing value for $1"
+        current_identity_file="$2"
+        shift 2
+        ;;
+      -h|--help)
+        print_connect_help
+        exit 0
+        ;;
+      --)
+        shift
+        while (($# > 0)); do
+          PARSED_REMOTE_COMMAND+=("$1")
+          shift
+        done
+        ;;
+      *)
+        fail "Unsupported option: $1"
+        ;;
+    esac
+  done
+
+  PARSED_IDENTITY_FILE="${current_identity_file}"
+}
+
+connect_target() {
+  require_ssh
+  load_config
+
+  local -a remote_command=()
+
+  parse_identity_and_remote_command "$@"
+  local identity_file="${PARSED_IDENTITY_FILE}"
+  remote_command=("${PARSED_REMOTE_COMMAND[@]}")
+
+  local jump_target="${CAKESSH_VPS1_USER}@${CAKESSH_VPS1_IPV4}"
+  local target_host="${CAKESSH_VPS2_USER}@$(format_ssh_host "${CAKESSH_VPS2_HOST}")"
+  local -a ssh_cmd=(ssh)
+  local use_jump="yes"
+
+  if local_has_ipv4 "${CAKESSH_VPS1_IPV4}"; then
+    use_jump="no"
+  fi
+
+  if [[ "${use_jump}" == "yes" ]]; then
+    if [[ "${CAKESSH_VPS1_SSH_PORT:-22}" != "22" ]]; then
+      jump_target="${jump_target}:${CAKESSH_VPS1_SSH_PORT}"
+    fi
+
+    ssh_cmd+=(-J "${jump_target}")
+  fi
+
+  if [[ -n "${identity_file}" ]]; then
+    [[ -f "${identity_file}" ]] || fail "Identity file not found: ${identity_file}"
+    ssh_cmd+=(-i "${identity_file}")
+  fi
+
+  if [[ "${CAKESSH_VPS2_SSH_PORT:-22}" != "22" ]]; then
+    ssh_cmd+=(-p "${CAKESSH_VPS2_SSH_PORT}")
+  fi
+
+  ssh_cmd+=("${target_host}")
+
+  if ((${#remote_command[@]} > 0)); then
+    ssh_cmd+=("${remote_command[@]}")
+  fi
+
+  exec "${ssh_cmd[@]}"
+}
+
+connect_direct() {
+  require_ssh
+  load_config
+
+  parse_identity_and_remote_command "$@"
+  local identity_file="${PARSED_IDENTITY_FILE}"
+  local -a remote_command=("${PARSED_REMOTE_COMMAND[@]}")
+  local public_port="${CAKESSH_PUBLIC_SSH_FORWARD_PORT:-}"
+  local target_host="${CAKESSH_VPS2_USER}@${CAKESSH_VPS1_IPV4}"
+  local -a ssh_cmd=(ssh)
+
+  [[ -n "${public_port}" ]] || fail "Public SSH relay port is not configured."
+
+  if [[ -n "${identity_file}" ]]; then
+    [[ -f "${identity_file}" ]] || fail "Identity file not found: ${identity_file}"
+    ssh_cmd+=(-i "${identity_file}")
+  fi
+
+  ssh_cmd+=(-p "${public_port}" "${target_host}")
+
+  if ((${#remote_command[@]} > 0)); then
+    ssh_cmd+=("${remote_command[@]}")
+  fi
+
+  exec "${ssh_cmd[@]}"
+}
+
+uninstall_local() {
+  local helper_path
+  local ssh_alias_config="${HOME}/.ssh/config.d/cakessh.conf"
+  helper_path="$(command -v cakessh || true)"
+
+  if [[ -z "${helper_path}" && -f "$0" ]]; then
+    helper_path="$0"
+  fi
+
+  if [[ -n "${helper_path}" && -f "${helper_path}" ]]; then
+    rm -f -- "${helper_path}"
+    printf 'Removed helper: %s\n' "${helper_path}"
+  fi
+
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    rm -f -- "${CONFIG_FILE}"
+    printf 'Removed config: %s\n' "${CONFIG_FILE}"
+  fi
+
+  if [[ -f "${ssh_alias_config}" ]]; then
+    rm -f -- "${ssh_alias_config}"
+    printf 'Removed SSH aliases: %s\n' "${ssh_alias_config}"
+  fi
+
+  if [[ -d "${CONFIG_DIR}" ]]; then
+    rmdir "${CONFIG_DIR}" 2>/dev/null || true
+  fi
+}
+
+main() {
+  local command="${1:-help}"
+  case "${command}" in
+    connect)
+      shift
+      connect_target "$@"
+      ;;
+    direct)
+      shift
+      connect_direct "$@"
+      ;;
+    status)
+      shift
+      [[ $# -eq 0 ]] || fail "status does not accept extra arguments"
+      show_status
+      ;;
+    uninstall)
+      shift
+      [[ $# -eq 0 ]] || fail "uninstall does not accept extra arguments"
+      uninstall_local
+      ;;
+    help|-h|--help)
+      print_help
+      ;;
+    *)
+      fail "Unknown command: ${command}. Run \`cakessh help\`."
+      ;;
+  esac
+}
+
+main "$@"

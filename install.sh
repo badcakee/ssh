@@ -106,7 +106,7 @@ Optional flags:
   --identity-file /path/to/key
   --public-ssh-port 2222
   --wings-scheme http|https
-  --game-ports 25565,25566
+  --game-ports 25565,25566,3000-4000
   --wg-interface cakessh-wg
   --wg-port 51820
   --wg-vps1-address 10.0.0.1/24
@@ -414,9 +414,29 @@ array_contains() {
 normalize_game_ports() {
   local cleaned="${GAME_PORTS_RAW//,/ }"
   local token=""
+  local range_start=""
+  local range_end=""
+  local current_port=""
   GAME_PORT_LIST=()
 
   for token in ${cleaned}; do
+    if [[ "${token}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      range_start="${BASH_REMATCH[1]}"
+      range_end="${BASH_REMATCH[2]}"
+      validate_port "${range_start}"
+      validate_port "${range_end}"
+      ((range_start <= range_end)) || fail "Invalid port range: ${token}"
+
+      current_port="${range_start}"
+      while ((current_port <= range_end)); do
+        if ! array_contains "${current_port}" "${GAME_PORT_LIST[@]:-}"; then
+          GAME_PORT_LIST+=("${current_port}")
+        fi
+        ((current_port++))
+      done
+      continue
+    fi
+
     validate_port "${token}"
     if ! array_contains "${token}" "${GAME_PORT_LIST[@]:-}"; then
       GAME_PORT_LIST+=("${token}")
@@ -556,9 +576,14 @@ ensure_wireguard_installed() {
     return 0
   fi
 
-  info "Installing WireGuard tools with apt..."
+  info "Installing WireGuard with apt..."
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard-tools
+
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard wireguard-tools; then
+    warn "Full WireGuard package install failed, trying wireguard-tools only."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard-tools
+  fi
+
   command -v wg >/dev/null 2>&1 || fail "WireGuard installation failed: wg not found."
   command -v wg-quick >/dev/null 2>&1 || fail "WireGuard installation failed: wg-quick not found."
 }
