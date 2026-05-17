@@ -715,12 +715,26 @@ ensure_wireguard_backend_reachability() {
 
 port_is_in_use() {
   local port="$1"
-  ss -Hln "sport = :${port}" 2>/dev/null | grep -q .
+  ss -Hltn "( sport = :${port} )" 2>/dev/null | grep -q .
+}
+
+describe_port_usage() {
+  local port="$1"
+
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp "( sport = :${port} )" 2>/dev/null || true
+  fi
+
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true
+  fi
 }
 
 ensure_port_is_free() {
   local port="$1"
   if port_is_in_use "${port}"; then
+    printf 'Detected TCP listener on VPS1 for port %s:\n' "${port}" >&2
+    describe_port_usage "${port}" >&2 || true
     fail "Port ${port} is already in use on VPS1."
   fi
 }
