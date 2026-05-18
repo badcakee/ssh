@@ -89,6 +89,8 @@ Usage:
   sudo bash install.sh vps1
   sudo bash install.sh vps2
   sudo bash install.sh all
+  sudo bash install.sh show-key vps1
+  sudo bash install.sh show-key vps2
   sudo bash install.sh remove vps1
 
 Roles:
@@ -104,7 +106,7 @@ Client extras:
 
 Optional flags:
   --role client|vps1|vps2|all
-  --mode install|remove
+  --mode install|remove|show-key
   --vps1-ipv4 203.0.113.10
   --vps1-user root
   --vps1-ssh-port 22
@@ -127,6 +129,10 @@ Uninstall:
   bash uninstall.sh client
   sudo bash uninstall.sh vps1
   sudo bash uninstall.sh vps2
+
+Show WireGuard public keys:
+  sudo bash install.sh show-key vps1
+  sudo bash install.sh show-key vps2
 EOF
 }
 
@@ -223,6 +229,20 @@ is_supported_role() {
 parse_args() {
   while (($# > 0)); do
     case "$1" in
+      show-key)
+        ACTION="show-key"
+        shift
+        ;;
+      show-vps1-key)
+        ACTION="show-key"
+        ROLE="vps1"
+        shift
+        ;;
+      show-vps2-key)
+        ACTION="show-key"
+        ROLE="vps2"
+        shift
+        ;;
       client|vps1|vps2|all)
         [[ -z "${ROLE}" ]] || fail "Role already set to ${ROLE}"
         ROLE="$1"
@@ -332,7 +352,7 @@ parse_args() {
   done
 
   case "${ACTION}" in
-    install|remove) ;;
+    install|remove|show-key) ;;
     *) fail "Unsupported mode: ${ACTION}" ;;
   esac
 
@@ -347,30 +367,48 @@ prompt_role_if_needed() {
   fi
 
   if ! stdin_is_tty; then
-    if [[ "${ACTION}" == "remove" ]]; then
-      ROLE="vps1"
-    else
-      ROLE="all"
-    fi
+    case "${ACTION}" in
+      remove|show-key) ROLE="vps1" ;;
+      *) ROLE="all" ;;
+    esac
     return 0
   fi
 
   local reply=""
   while true; do
-    if [[ "${ACTION}" == "remove" ]]; then
-      read -r -p "What do you want to remove? (client/vps1/vps2/all) [vps1]: " reply
-      reply="${reply:-vps1}"
-    else
-      read -r -p "Which role do you want to install? (client/vps1/vps2/all) [all]: " reply
-      reply="${reply:-all}"
-    fi
-
-    if is_supported_role "${reply}"; then
-      ROLE="${reply}"
-      return 0
-    fi
-
-    info "Please choose client, vps1, vps2, or all."
+    case "${ACTION}" in
+      remove)
+        read -r -p "What do you want to remove? (client/vps1/vps2/all) [vps1]: " reply
+        reply="${reply:-vps1}"
+        if is_supported_role "${reply}"; then
+          ROLE="${reply}"
+          return 0
+        fi
+        info "Please choose client, vps1, vps2, or all."
+        ;;
+      show-key)
+        read -r -p "Which WireGuard public key do you want to show? (vps1/vps2) [vps1]: " reply
+        reply="${reply:-vps1}"
+        case "${reply}" in
+          vps1|vps2)
+            ROLE="${reply}"
+            return 0
+            ;;
+          *)
+            info "Please choose vps1 or vps2."
+            ;;
+        esac
+        ;;
+      *)
+        read -r -p "Which role do you want to install? (client/vps1/vps2/all) [all]: " reply
+        reply="${reply:-all}"
+        if is_supported_role "${reply}"; then
+          ROLE="${reply}"
+          return 0
+        fi
+        info "Please choose client, vps1, vps2, or all."
+        ;;
+    esac
   done
 }
 
@@ -675,6 +713,10 @@ wireguard_public_key_path() {
   printf '%s/%s.publickey' "$(wireguard_state_dir)" "${node_role}"
 }
 
+install_state_path() {
+  printf '/etc/cakessh/install.env'
+}
+
 forwarder_service_name() {
   printf 'cakessh-forward.service'
 }
@@ -767,7 +809,59 @@ remove_wireguard() {
   rm -f -- "$(wireguard_public_key_path "vps1")"
   rm -f -- "$(wireguard_private_key_path "vps2")"
   rm -f -- "$(wireguard_public_key_path "vps2")"
+  rm -f -- "$(install_state_path)"
   rmdir "$(wireguard_state_dir)" 2>/dev/null || true
+}
+
+load_install_state() {
+  local state_path=""
+
+  state_path="$(install_state_path)"
+  [[ -r "${state_path}" ]] || return 0
+
+  # shellcheck disable=SC1090
+  . "${state_path}"
+
+  VPS1_IPV4="${VPS1_IPV4:-${STATE_VPS1_IPV4:-}}"
+  VPS1_USER="${VPS1_USER:-${STATE_VPS1_USER:-}}"
+  VPS1_SSH_PORT="${VPS1_SSH_PORT:-${STATE_VPS1_SSH_PORT:-}}"
+  VPS2_USER="${VPS2_USER:-${STATE_VPS2_USER:-}}"
+  VPS2_SSH_PORT="${VPS2_SSH_PORT:-${STATE_VPS2_SSH_PORT:-}}"
+  PUBLIC_SSH_FORWARD_PORT="${PUBLIC_SSH_FORWARD_PORT:-${STATE_PUBLIC_SSH_FORWARD_PORT:-}}"
+  WINGS_SCHEME="${WINGS_SCHEME:-${STATE_WINGS_SCHEME:-}}"
+  GAME_PORTS_RAW="${GAME_PORTS_RAW:-${STATE_GAME_PORTS_RAW:-}}"
+  WG_INTERFACE="${WG_INTERFACE:-${STATE_WG_INTERFACE:-}}"
+  WG_PORT="${WG_PORT:-${STATE_WG_PORT:-}}"
+  WG_VPS1_ADDRESS="${WG_VPS1_ADDRESS:-${STATE_WG_VPS1_ADDRESS:-}}"
+  WG_VPS2_ADDRESS="${WG_VPS2_ADDRESS:-${STATE_WG_VPS2_ADDRESS:-}}"
+  WG_VPS1_PUBLIC_KEY="${WG_VPS1_PUBLIC_KEY:-${STATE_WG_VPS1_PUBLIC_KEY:-}}"
+  WG_VPS2_PUBLIC_KEY="${WG_VPS2_PUBLIC_KEY:-${STATE_WG_VPS2_PUBLIC_KEY:-}}"
+}
+
+save_install_state() {
+  local state_path=""
+
+  state_path="$(install_state_path)"
+  mkdir -p /etc/cakessh
+
+  {
+    printf 'STATE_VPS1_IPV4=%q\n' "${VPS1_IPV4}"
+    printf 'STATE_VPS1_USER=%q\n' "${VPS1_USER}"
+    printf 'STATE_VPS1_SSH_PORT=%q\n' "${VPS1_SSH_PORT}"
+    printf 'STATE_VPS2_USER=%q\n' "${VPS2_USER}"
+    printf 'STATE_VPS2_SSH_PORT=%q\n' "${VPS2_SSH_PORT}"
+    printf 'STATE_PUBLIC_SSH_FORWARD_PORT=%q\n' "${PUBLIC_SSH_FORWARD_PORT}"
+    printf 'STATE_WINGS_SCHEME=%q\n' "${WINGS_SCHEME}"
+    printf 'STATE_GAME_PORTS_RAW=%q\n' "${GAME_PORTS_RAW}"
+    printf 'STATE_WG_INTERFACE=%q\n' "${WG_INTERFACE}"
+    printf 'STATE_WG_PORT=%q\n' "${WG_PORT}"
+    printf 'STATE_WG_VPS1_ADDRESS=%q\n' "${WG_VPS1_ADDRESS}"
+    printf 'STATE_WG_VPS2_ADDRESS=%q\n' "${WG_VPS2_ADDRESS}"
+    printf 'STATE_WG_VPS1_PUBLIC_KEY=%q\n' "${WG_VPS1_PUBLIC_KEY}"
+    printf 'STATE_WG_VPS2_PUBLIC_KEY=%q\n' "${WG_VPS2_PUBLIC_KEY}"
+  } > "${state_path}"
+
+  chmod 0600 "${state_path}"
 }
 
 ensure_wireguard_backend_reachability() {
@@ -1554,7 +1648,7 @@ prompt_install_inputs() {
     prompt_value WG_VPS2_ADDRESS "VPS2 WireGuard address" "${DEFAULT_WG_VPS2_ADDRESS}"
 
     if [[ -z "${WG_VPS2_PUBLIC_KEY}" ]] && prompt_yes_no "Do you already have the VPS2 WireGuard public key?" "n"; then
-      prompt_optional_value WG_VPS2_PUBLIC_KEY "Paste the VPS2 WireGuard public key"
+      prompt_optional_value WG_VPS2_PUBLIC_KEY "Paste the VPS2 WireGuard public key (run: sudo bash install.sh show-key vps2 on VPS2)"
     fi
 
     if [[ -z "${WINGS_SCHEME}" ]]; then
@@ -1573,7 +1667,7 @@ prompt_install_inputs() {
     prompt_value WG_PORT "WireGuard UDP port on VPS1" "${DEFAULT_WG_PORT}"
     prompt_value WG_VPS1_ADDRESS "VPS1 WireGuard address" "${DEFAULT_WG_VPS1_ADDRESS}"
     prompt_value WG_VPS2_ADDRESS "VPS2 WireGuard address" "${DEFAULT_WG_VPS2_ADDRESS}"
-    prompt_value WG_VPS1_PUBLIC_KEY "VPS1 WireGuard public key" ""
+    prompt_value WG_VPS1_PUBLIC_KEY "VPS1 WireGuard public key (run: sudo bash install.sh show-key vps1 on VPS1)" ""
   fi
 }
 
@@ -1633,21 +1727,27 @@ validate_vps2_inputs() {
   validate_ipv4_basic "${VPS1_IPV4}"
   validate_port "${WG_PORT}"
   validate_wireguard_public_key_if_present "${WG_VPS1_PUBLIC_KEY}"
-  [[ -n "${WG_VPS1_PUBLIC_KEY}" ]] || fail "VPS2 install requires --wg-vps1-public-key."
+  [[ -n "${WG_VPS1_PUBLIC_KEY}" ]] || fail "VPS2 install needs the VPS1 public key. On VPS1 run: sudo bash install.sh show-key vps1"
 }
 
 print_vps1_bootstrap_summary() {
   info ""
   info "VPS1 WireGuard bootstrap complete."
   info "Autostart enabled: $(wireguard_service_name)"
-  info "VPS1 WireGuard public key:"
-  info "  ${LOCAL_WG_PUBLIC_KEY}"
   info ""
-  info "Run this on VPS2 next:"
-  info "  sudo bash install.sh vps2 --vps1-ipv4 ${VPS1_IPV4} --wg-interface ${WG_INTERFACE} --wg-port ${WG_PORT} --wg-vps1-address ${WG_VPS1_ADDRESS} --wg-vps2-address ${WG_VPS2_ADDRESS} --wg-vps1-public-key ${LOCAL_WG_PUBLIC_KEY}"
+  info "Next steps:"
+  info "  1. On VPS1, show the key when you need it:"
+  info "     sudo bash install.sh show-key vps1"
+  info "  2. On VPS2, run:"
+  info "     sudo bash install.sh vps2 --vps1-ipv4 ${VPS1_IPV4}"
+  info "     Paste the VPS1 key when asked."
   info ""
-  info "After VPS2 prints its public key, rerun this on VPS1 to finish the relays:"
-  info "  sudo bash install.sh vps1 --vps1-ipv4 ${VPS1_IPV4} --vps2-user ${VPS2_USER} --vps2-ssh-port ${VPS2_SSH_PORT} --public-ssh-port ${PUBLIC_SSH_FORWARD_PORT} --wings-scheme ${WINGS_SCHEME} --game-ports ${GAME_PORTS_CANONICAL} --wg-interface ${WG_INTERFACE} --wg-port ${WG_PORT} --wg-vps1-address ${WG_VPS1_ADDRESS} --wg-vps2-address ${WG_VPS2_ADDRESS} --wg-vps2-public-key <PASTE_VPS2_PUBLIC_KEY>"
+  info "  3. On VPS2, show its key:"
+  info "     sudo bash install.sh show-key vps2"
+  info "  4. Back on VPS1, run:"
+  info "     sudo bash install.sh vps1"
+  info "     Paste the VPS2 key when asked."
+  info "     Your saved VPS1 settings will be reused automatically."
   info ""
   info "After that you can use either:"
   info "  cakessh connect"
@@ -1658,11 +1758,14 @@ print_vps2_summary() {
   info ""
   info "VPS2 WireGuard install complete."
   info "Autostart enabled: $(wireguard_service_name)"
-  info "VPS2 WireGuard public key:"
-  info "  ${LOCAL_WG_PUBLIC_KEY}"
   info ""
-  info "Run this on VPS1 now:"
-  info "  sudo bash install.sh vps1 --vps1-ipv4 ${VPS1_IPV4} --vps2-user ${DEFAULT_VPS2_USER} --vps2-ssh-port ${DEFAULT_VPS2_SSH_PORT} --public-ssh-port ${DEFAULT_PUBLIC_SSH_FORWARD_PORT} --wings-scheme ${DEFAULT_WINGS_SCHEME} --game-ports ${DEFAULT_GAME_PORTS_RAW} --wg-interface ${WG_INTERFACE} --wg-port ${WG_PORT} --wg-vps1-address ${WG_VPS1_ADDRESS} --wg-vps2-address ${WG_VPS2_ADDRESS} --wg-vps2-public-key ${LOCAL_WG_PUBLIC_KEY}"
+  info "Next steps:"
+  info "  1. On VPS2, show the key:"
+  info "     sudo bash install.sh show-key vps2"
+  info "  2. Back on VPS1, run:"
+  info "     sudo bash install.sh vps1"
+  info "     Paste the VPS2 key when asked."
+  info "     Your saved VPS1 settings will be reused automatically."
 }
 
 install_vps1() {
@@ -1680,6 +1783,7 @@ install_vps1() {
   generate_local_wireguard_keys "vps1"
   write_vps1_wireguard_config
   upsert_wireguard_service
+  save_install_state
 
   if [[ -z "${WG_VPS2_PUBLIC_KEY}" ]]; then
     progress 3 5 "Waiting for VPS2 public key to finish setup"
@@ -1700,6 +1804,7 @@ install_vps1() {
   systemctl daemon-reload
   upsert_forwarder_service
   configure_ufw
+  save_install_state
 
   progress 5 5 "VPS1 setup finished"
   wings_port="$(calc_wings_port)"
@@ -1739,6 +1844,7 @@ install_vps2() {
 
   progress 3 4 "Enabling WireGuard autostart on VPS2"
   upsert_wireguard_service
+  save_install_state
   progress 4 4 "VPS2 setup finished"
   print_vps2_summary
 }
@@ -1800,6 +1906,30 @@ remove_vps2() {
   info "Removed WireGuard from VPS2."
 }
 
+show_public_key() {
+  local key_path=""
+
+  require_root
+  case "${ROLE}" in
+    vps1|vps2) ;;
+    *) fail "show-key only supports vps1 or vps2." ;;
+  esac
+
+  apply_defaults
+  key_path="$(wireguard_public_key_path "${ROLE}")"
+  [[ -f "${key_path}" ]] || fail "No WireGuard public key found for ${ROLE}. Run: sudo bash install.sh ${ROLE}"
+
+  info ""
+  info "${ROLE} WireGuard public key:"
+  cat "${key_path}"
+  info ""
+  if [[ "${ROLE}" == "vps1" ]]; then
+    info "Paste this into the VPS2 install when it asks for the VPS1 key."
+  else
+    info "Paste this into the VPS1 install when it asks for the VPS2 key."
+  fi
+}
+
 run_remove() {
   case "${ROLE}" in
     client)
@@ -1852,9 +1982,15 @@ run_install() {
 main() {
   parse_args "$@"
   prompt_role_if_needed
+  load_install_state
 
   if [[ "${ACTION}" == "remove" ]]; then
     run_remove
+    return 0
+  fi
+
+  if [[ "${ACTION}" == "show-key" ]]; then
+    show_public_key
     return 0
   fi
 
