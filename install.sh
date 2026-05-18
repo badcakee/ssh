@@ -32,6 +32,7 @@ CLIENT_INSTALL_USER=""
 CLIENT_INSTALL_HOME=""
 LOCAL_WG_PRIVATE_KEY=""
 LOCAL_WG_PUBLIC_KEY=""
+VPS2_SSH_REACHABLE="unknown"
 
 RELAY_NAMES=()
 RELAY_LISTEN_PORTS=()
@@ -55,8 +56,8 @@ DEFAULT_WINGS_SCHEME="http"
 DEFAULT_GAME_PORTS_RAW="25565"
 DEFAULT_WG_INTERFACE="cakessh-wg"
 DEFAULT_WG_PORT="51820"
-DEFAULT_WG_VPS1_ADDRESS="10.0.0.1/24"
-DEFAULT_WG_VPS2_ADDRESS="10.0.0.2/24"
+DEFAULT_WG_VPS1_ADDRESS="172.31.250.1/30"
+DEFAULT_WG_VPS2_ADDRESS="172.31.250.2/30"
 
 fail() {
   printf 'Error: %s\n' "$*" >&2
@@ -597,6 +598,38 @@ normalize_wireguard_addresses() {
   [[ "${WG_VPS1_IP}" != "${WG_VPS2_IP}" ]] || fail "VPS1 and VPS2 WireGuard IPs must be different."
 }
 
+find_local_ip_conflict_interface() {
+  local target_ip="$1"
+  local interface_name=""
+  local address_cidr=""
+  local current_ip=""
+
+  command -v ip >/dev/null 2>&1 || return 1
+
+  while read -r interface_name address_cidr; do
+    [[ -n "${interface_name}" && -n "${address_cidr}" ]] || continue
+    current_ip="${address_cidr%%/*}"
+    [[ "${current_ip}" == "${target_ip}" ]] || continue
+
+    if [[ "${interface_name}" != "${WG_INTERFACE}" ]]; then
+      printf '%s\n' "${interface_name}"
+      return 0
+    fi
+  done < <(ip -o -4 addr show | awk '{print $2, $4}')
+
+  return 1
+}
+
+ensure_local_wireguard_ip_available() {
+  local target_ip="$1"
+  local conflict_interface=""
+
+  conflict_interface="$(find_local_ip_conflict_interface "${target_ip}" || true)"
+  if [[ -n "${conflict_interface}" ]]; then
+    fail "WireGuard IP ${target_ip} is already assigned to interface ${conflict_interface} on this server. Pick a different subnet, for example --wg-vps1-address 172.31.250.1/30 --wg-vps2-address 172.31.250.2/30."
+  fi
+}
+
 validate_identity_file_if_present() {
   if [[ -n "${IDENTITY_FILE}" && ! -f "${IDENTITY_FILE}" ]]; then
     fail "Identity file not found: ${IDENTITY_FILE}"
@@ -864,20 +897,63 @@ save_install_state() {
   chmod 0600 "${state_path}"
 }
 
+wireguard_peer_has_handshake() {
+  command -v wg >/dev/null 2>&1 || return 1
+  [[ -n "${WG_VPS2_PUBLIC_KEY}" ]] || return 1
+
+  wg show "${WG_INTERFACE}" latest-handshakes 2>/dev/null \
+    | awk -v peer_key="${WG_VPS2_PUBLIC_KEY}" '$1 == peer_key && $2 > 0 { found=1 } END { exit found ? 0 : 1 }'
+}
+
 ensure_wireguard_backend_reachability() {
-  if command -v nc >/dev/null 2>&1; then
-    nc -z -w 2 "${WG_VPS2_IP}" "${VPS2_SSH_PORT}" >/dev/null 2>&1 \
-      || fail "VPS1 cannot reach ${WG_VPS2_IP}:${VPS2_SSH_PORT} over WireGuard. Make sure VPS2 is installed and connected."
-    return 0
-  fi
+  local ping_ok="no"
+  local attempt=0
+  local max_attempts=30
 
-  if command -v ping >/dev/null 2>&1; then
-    ping -c 1 -W 2 "${WG_VPS2_IP}" >/dev/null 2>&1 \
-      || fail "VPS1 cannot ping ${WG_VPS2_IP} over WireGuard. Make sure VPS2 is installed and connected."
-    return 0
-  fi
+  VPS2_SSH_REACHABLE="unknown"
+  info "Waiting for WireGuard reachability to ${WG_VPS2_IP}..."
+  info "This can take around 25 seconds after VPS1 adds the peer."
+  info "If this keeps waiting, run this on VPS2 in another terminal:"
+  info "  ping -c 2 ${WG_VPS1_IP}"
 
-  fail "Could not find nc or ping to validate WireGuard reachability."
+  while ((attempt < max_attempts)); do
+    ping_ok="no"
+
+    if command -v ping >/dev/null 2>&1; then
+      if ping -c 1 -W 2 "${WG_VPS2_IP}" >/dev/null 2>&1; then
+        ping_ok="yes"
+      fi
+    fi
+
+    if command -v nc >/dev/null 2>&1; then
+      if nc -z -w 2 "${WG_VPS2_IP}" "${VPS2_SSH_PORT}" >/dev/null 2>&1; then
+        VPS2_SSH_REACHABLE="yes"
+        return 0
+      fi
+
+      if [[ "${ping_ok}" == "yes" ]]; then
+        VPS2_SSH_REACHABLE="no"
+        warn "WireGuard is up, but VPS2 SSH port ${VPS2_SSH_PORT} is unreachable at ${WG_VPS2_IP}. Continuing with VPS1 setup, but direct SSH will not work until sshd is running on VPS2 and port ${VPS2_SSH_PORT} is open there."
+        return 0
+      fi
+    elif [[ "${ping_ok}" == "yes" ]]; then
+      VPS2_SSH_REACHABLE="unknown"
+      return 0
+    fi
+
+    if wireguard_peer_has_handshake; then
+      VPS2_SSH_REACHABLE="unknown"
+      warn "Detected a WireGuard handshake with VPS2, so continuing with VPS1 setup. If direct SSH still fails later, test: nc -vz ${WG_VPS2_IP} ${VPS2_SSH_PORT}"
+      return 0
+    fi
+
+    attempt=$((attempt + 1))
+    ((attempt < max_attempts)) || break
+    info "  WireGuard not ready yet (${attempt}/${max_attempts}). Retrying in 2 seconds..."
+    sleep 2
+  done
+
+  fail "VPS1 cannot reach ${WG_VPS2_IP} over WireGuard yet. Make sure VPS2 finished install, UDP ${WG_PORT}/udp is open on VPS1, and both sides show a handshake with: sudo wg show"
 }
 
 port_is_in_use() {
@@ -1345,6 +1421,7 @@ delete_jump_if_exists() {
 remove_rules() {
   delete_jump_if_exists filter FORWARD CAKESSH_FORWARD
   delete_jump_if_exists nat POSTROUTING CAKESSH_SNAT
+  delete_jump_if_exists nat OUTPUT CAKESSH_DNAT
   delete_jump_if_exists nat PREROUTING CAKESSH_DNAT
   delete_chain_if_exists filter CAKESSH_FORWARD
   delete_chain_if_exists nat CAKESSH_SNAT
@@ -1391,6 +1468,7 @@ install_rules() {
     "${IPTABLES_BIN}" -t filter -A CAKESSH_FORWARD -o "${WG_INTERFACE}" -p tcp -d "${WG_VPS2_IP}" --dport "${target_iptables_spec}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
   done
 
+  ensure_jump nat OUTPUT CAKESSH_DNAT
   ensure_jump nat PREROUTING CAKESSH_DNAT
   ensure_jump nat POSTROUTING CAKESSH_SNAT
   ensure_jump filter FORWARD CAKESSH_FORWARD
@@ -1607,6 +1685,34 @@ configure_ufw() {
   done < <(forwarded_public_port_specs)
 }
 
+configure_wireguard_firewall() {
+  if ! command -v ufw >/dev/null 2>&1; then
+    warn "ufw is not installed. Make sure UDP ${WG_PORT}/udp is open on VPS1 if another firewall is enabled."
+    return 0
+  fi
+
+  if ! ufw status 2>/dev/null | grep -q '^Status: active'; then
+    warn "ufw is not active. Make sure UDP ${WG_PORT}/udp is open on VPS1 if another firewall is enabled."
+    return 0
+  fi
+
+  ufw allow "${WG_PORT}/udp" >/dev/null
+}
+
+configure_vps2_tunnel_firewall() {
+  if ! command -v ufw >/dev/null 2>&1; then
+    warn "ufw is not installed. Make sure traffic from ${WG_VPS1_IP} to VPS2 is allowed on ${WG_INTERFACE} if another firewall is enabled."
+    return 0
+  fi
+
+  if ! ufw status 2>/dev/null | grep -q '^Status: active'; then
+    warn "ufw is not active. Make sure traffic from ${WG_VPS1_IP} to VPS2 is allowed on ${WG_INTERFACE} if another firewall is enabled."
+    return 0
+  fi
+
+  ufw allow in on "${WG_INTERFACE}" from "${WG_VPS1_IP}" >/dev/null
+}
+
 validate_vps1_relay_phase() {
   local listen_port=""
 
@@ -1713,6 +1819,7 @@ validate_vps1_inputs() {
   apply_defaults
   normalize_wireguard_addresses
   validate_ipv4_basic "${VPS1_IPV4}"
+  ensure_local_wireguard_ip_available "${WG_VPS1_IP}"
   validate_port "${VPS2_SSH_PORT}"
   validate_port "${PUBLIC_SSH_FORWARD_PORT}"
   validate_port "${WG_PORT}"
@@ -1725,6 +1832,7 @@ validate_vps2_inputs() {
   apply_defaults
   normalize_wireguard_addresses
   validate_ipv4_basic "${VPS1_IPV4}"
+  ensure_local_wireguard_ip_available "${WG_VPS2_IP}"
   validate_port "${WG_PORT}"
   validate_wireguard_public_key_if_present "${WG_VPS1_PUBLIC_KEY}"
   [[ -n "${WG_VPS1_PUBLIC_KEY}" ]] || fail "VPS2 install needs the VPS1 public key. On VPS1 run: sudo bash install.sh show-key vps1"
@@ -1783,6 +1891,7 @@ install_vps1() {
   generate_local_wireguard_keys "vps1"
   write_vps1_wireguard_config
   upsert_wireguard_service
+  configure_wireguard_firewall
   save_install_state
 
   if [[ -z "${WG_VPS2_PUBLIC_KEY}" ]]; then
@@ -1828,6 +1937,9 @@ install_vps1() {
   info "  sftp -P 2022 ${VPS2_USER}@${VPS1_IPV4}"
   info "Minecraft test:"
   info "  nc -vz ${VPS1_IPV4} ${first_game_port}"
+  if [[ "${VPS2_SSH_REACHABLE}" == "no" ]]; then
+    warn "VPS2 SSH on ${WG_VPS2_IP}:${VPS2_SSH_PORT} was not reachable during install. Direct SSH through VPS1 may fail until sshd is listening there."
+  fi
 }
 
 install_vps2() {
@@ -1844,6 +1956,7 @@ install_vps2() {
 
   progress 3 4 "Enabling WireGuard autostart on VPS2"
   upsert_wireguard_service
+  configure_vps2_tunnel_firewall
   save_install_state
   progress 4 4 "VPS2 setup finished"
   print_vps2_summary
