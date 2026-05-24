@@ -25,6 +25,7 @@ PEER_SSH_PORT=""
 PEER_PUBLIC_SSH_PORT=""
 PEER_WINGS_PUBLIC_PORT=""
 PEER_WINGS_TARGET_PORT=""
+PEER_GAME_PORTS_RAW=""
 
 WG_INTERFACE=""
 WG_PORT=""
@@ -77,8 +78,8 @@ DEFAULT_WINGS_HTTPS_PORT="8443"
 DEFAULT_GAME_PORTS_RAW="25565"
 DEFAULT_WG_INTERFACE="cakessh-wg"
 DEFAULT_WG_PORT="51820"
-DEFAULT_WG_VPS1_ADDRESS="172.31.250.1/30"
-DEFAULT_WG_VPS2_ADDRESS="172.31.250.2/30"
+DEFAULT_WG_VPS1_ADDRESS="172.31.250.1/24"
+DEFAULT_WG_VPS2_ADDRESS="172.31.250.2/32"
 DEFAULT_WG_PEER_ADDRESS="172.31.250.3/32"
 DEFAULT_WG_WATCHDOG_STALE_SECONDS="1800"
 DEFAULT_WG_WATCHDOG_RESTART_ON_STALE="no"
@@ -150,6 +151,7 @@ Optional flags:
   --peer-public-ssh-port 2223
   --peer-wings-public-port 8081
   --peer-wings-target-port 8080
+  --peer-game-ports 25566:25565,25567
   --identity-file /path/to/key
   --public-ssh-port 2222
   --wings-scheme http|https
@@ -160,7 +162,7 @@ Optional flags:
   --wg-interface cakessh-wg
   --wg-port 51820
   --wg-vps1-address 10.0.0.1/24
-  --wg-vps2-address 10.0.0.2/24
+  --wg-vps2-address 10.0.0.2/32
   --wg-peer-address 172.31.250.3/32
   --wg-vps1-public-key BASE64KEY
   --wg-vps2-public-key BASE64KEY
@@ -367,6 +369,11 @@ parse_args() {
       --peer-wings-target-port)
         [[ $# -ge 2 ]] || fail "Missing value for --peer-wings-target-port"
         PEER_WINGS_TARGET_PORT="$2"
+        shift 2
+        ;;
+      --peer-game-ports|--peer-allocation-ports)
+        [[ $# -ge 2 ]] || fail "Missing value for --peer-game-ports"
+        PEER_GAME_PORTS_RAW="$2"
         shift 2
         ;;
       --identity-file)
@@ -751,6 +758,62 @@ validate_peer_wings_settings() {
   validate_port "${PEER_WINGS_TARGET_PORT}"
 }
 
+split_peer_game_port_token() {
+  local token="$1"
+  local listen_var="$2"
+  local target_var="$3"
+  local listen_spec=""
+  local target_spec=""
+
+  if [[ "${token}" =~ ^([^:]+):([^:]+)$ ]]; then
+    listen_spec="${BASH_REMATCH[1]}"
+    target_spec="${BASH_REMATCH[2]}"
+  elif [[ "${token}" == *:* ]]; then
+    fail "Invalid peer game port mapping: ${token}"
+  else
+    listen_spec="${token}"
+    target_spec="${token}"
+  fi
+
+  printf -v "${listen_var}" '%s' "${listen_spec}"
+  printf -v "${target_var}" '%s' "${target_spec}"
+}
+
+validate_peer_game_ports() {
+  local cleaned="${PEER_GAME_PORTS_RAW//,/ }"
+  local token=""
+  local listen_spec=""
+  local target_spec=""
+
+  [[ -n "${PEER_GAME_PORTS_RAW}" ]] || return 0
+
+  for token in ${cleaned}; do
+    [[ -n "${token}" ]] || continue
+    split_peer_game_port_token "${token}" listen_spec target_spec
+    validate_port_spec "${listen_spec}"
+    validate_port_spec "${target_spec}"
+    if [[ "${listen_spec}" == *-* && "${target_spec}" != "${listen_spec}" ]]; then
+      fail "Peer game port ranges must use the same public and target range: ${listen_spec}:${target_spec}"
+    fi
+  done
+}
+
+print_peer_game_public_port_specs() {
+  local raw="$1"
+  local cleaned="${raw//,/ }"
+  local token=""
+  local listen_spec=""
+  local target_spec=""
+
+  [[ -n "${raw}" ]] || return 0
+
+  for token in ${cleaned}; do
+    [[ -n "${token}" ]] || continue
+    split_peer_game_port_token "${token}" listen_spec target_spec
+    printf '%s\n' "${listen_spec}"
+  done
+}
+
 validate_wireguard_watchdog_settings() {
   apply_defaults
   [[ "${WG_WATCHDOG_STALE_SECONDS}" =~ ^[0-9]+$ ]] || fail "WireGuard watchdog stale seconds must be numeric: ${WG_WATCHDOG_STALE_SECONDS}"
@@ -806,7 +869,7 @@ ensure_local_wireguard_ip_available() {
 
   conflict_interface="$(find_local_ip_conflict_interface "${target_ip}" || true)"
   if [[ -n "${conflict_interface}" ]]; then
-    fail "WireGuard IP ${target_ip} is already assigned to interface ${conflict_interface} on this server. Pick a different subnet, for example --wg-vps1-address 172.31.250.1/30 --wg-vps2-address 172.31.250.2/30."
+    fail "WireGuard IP ${target_ip} is already assigned to interface ${conflict_interface} on this server. Pick a different subnet, for example --wg-vps1-address 172.31.251.1/24 --wg-vps2-address 172.31.251.2/32."
   fi
 }
 
@@ -1284,6 +1347,7 @@ save_ssh_peer_state() {
     printf 'SSH_PEER_PUBLIC_SSH_PORT=%q\n' "${PEER_PUBLIC_SSH_PORT}"
     printf 'SSH_PEER_WINGS_PUBLIC_PORT=%q\n' "${PEER_WINGS_PUBLIC_PORT}"
     printf 'SSH_PEER_WINGS_TARGET_PORT=%q\n' "${PEER_WINGS_TARGET_PORT}"
+    printf 'SSH_PEER_GAME_PORTS_RAW=%q\n' "${PEER_GAME_PORTS_RAW}"
     printf 'SSH_PEER_WG_ADDRESS=%q\n' "${WG_PEER_ADDRESS}"
     printf 'SSH_PEER_WG_IP=%q\n' "${WG_PEER_IP}"
     printf 'SSH_PEER_PUBLIC_KEY=%q\n' "${WG_PEER_PUBLIC_KEY}"
@@ -2047,6 +2111,8 @@ forwarded_public_port_specs() {
   local peer_file=""
   local SSH_PEER_PUBLIC_SSH_PORT=""
   local SSH_PEER_WINGS_PUBLIC_PORT=""
+  local SSH_PEER_GAME_PORTS_RAW=""
+  local peer_game_public_port=""
   local -a port_specs=()
 
   port_specs+=("${PUBLIC_SSH_FORWARD_PORT}")
@@ -2059,10 +2125,15 @@ forwarded_public_port_specs() {
       [[ -f "${peer_file}" ]] || continue
       SSH_PEER_PUBLIC_SSH_PORT=""
       SSH_PEER_WINGS_PUBLIC_PORT=""
+      SSH_PEER_GAME_PORTS_RAW=""
       # shellcheck disable=SC1090
       . "${peer_file}"
       [[ -n "${SSH_PEER_PUBLIC_SSH_PORT}" ]] && port_specs+=("${SSH_PEER_PUBLIC_SSH_PORT}")
       [[ -n "${SSH_PEER_WINGS_PUBLIC_PORT}" ]] && port_specs+=("${SSH_PEER_WINGS_PUBLIC_PORT}")
+      while IFS= read -r peer_game_public_port; do
+        [[ -n "${peer_game_public_port}" ]] || continue
+        port_specs+=("${peer_game_public_port}")
+      done < <(print_peer_game_public_port_specs "${SSH_PEER_GAME_PORTS_RAW}")
     done
   fi
 
@@ -2224,6 +2295,9 @@ prompt_install_inputs() {
       prompt_value PEER_WINGS_PUBLIC_PORT "Public Wings port on VPS1 for this peer" "${DEFAULT_PEER_WINGS_PUBLIC_PORT}"
       prompt_value PEER_WINGS_TARGET_PORT "Wings port on this peer" "${DEFAULT_PEER_WINGS_TARGET_PORT}"
     fi
+    if [[ -z "${PEER_GAME_PORTS_RAW}" ]] && prompt_yes_no "Forward Minecraft allocation ports to this peer?" "n"; then
+      prompt_value PEER_GAME_PORTS_RAW "Peer allocation forwards (public[:target], comma-separated)" ""
+    fi
     prompt_value WG_PEER_PUBLIC_KEY "Peer WireGuard public key (run: sudo bash install.sh show-key peer on the peer)" ""
   fi
 }
@@ -2263,6 +2337,11 @@ add_extra_ssh_peer_forward_rules() {
   local SSH_PEER_SSH_PORT=""
   local SSH_PEER_WINGS_PUBLIC_PORT=""
   local SSH_PEER_WINGS_TARGET_PORT=""
+  local SSH_PEER_GAME_PORTS_RAW=""
+  local peer_game_token=""
+  local peer_game_listen_spec=""
+  local peer_game_target_spec=""
+  local peer_game_rule_name=""
 
   [[ -d "$(ssh_peer_state_dir)" ]] || return 0
 
@@ -2274,6 +2353,7 @@ add_extra_ssh_peer_forward_rules() {
     SSH_PEER_SSH_PORT=""
     SSH_PEER_WINGS_PUBLIC_PORT=""
     SSH_PEER_WINGS_TARGET_PORT=""
+    SSH_PEER_GAME_PORTS_RAW=""
     # shellcheck disable=SC1090
     . "${peer_file}"
     [[ -n "${SSH_PEER_NAME}" && -n "${SSH_PEER_WG_IP}" && -n "${SSH_PEER_PUBLIC_SSH_PORT}" ]] || continue
@@ -2283,6 +2363,12 @@ add_extra_ssh_peer_forward_rules() {
       [[ -n "${SSH_PEER_WINGS_PUBLIC_PORT}" && -n "${SSH_PEER_WINGS_TARGET_PORT}" ]] || fail "Peer ${SSH_PEER_NAME} has incomplete Wings forwarding state."
       add_forward_rule_to_host "${SSH_PEER_WG_IP}" "wings-${SSH_PEER_NAME}" "${SSH_PEER_WINGS_PUBLIC_PORT}" "${SSH_PEER_WINGS_TARGET_PORT}" "Pterodactyl Wings to ${SSH_PEER_NAME} over WireGuard"
     fi
+    for peer_game_token in ${SSH_PEER_GAME_PORTS_RAW//,/ }; do
+      [[ -n "${peer_game_token}" ]] || continue
+      split_peer_game_port_token "${peer_game_token}" peer_game_listen_spec peer_game_target_spec
+      peer_game_rule_name="game-${SSH_PEER_NAME}-${peer_game_listen_spec//[^0-9]/-}"
+      add_forward_rule_to_host "${SSH_PEER_WG_IP}" "${peer_game_rule_name}" "${peer_game_listen_spec}" "${peer_game_target_spec}" "Minecraft allocation to ${SSH_PEER_NAME} over WireGuard"
+    done
   done
 }
 
@@ -2347,6 +2433,7 @@ validate_vps1_add_peer_inputs() {
   validate_port "${WG_PORT}"
   normalize_wings_settings
   validate_peer_wings_settings
+  validate_peer_game_ports
   validate_wireguard_watchdog_settings
   normalize_game_ports
   validate_wireguard_public_key_if_present "${WG_PEER_PUBLIC_KEY}"
@@ -2405,6 +2492,7 @@ print_peer_summary() {
   info "  2. Back on VPS1, run:"
   info "     sudo bash install.sh vps1-add-peer --peer-name ${PEER_NAME} --wg-peer-address ${WG_PEER_ADDRESS}"
   info "     Paste the peer key when asked."
+  info "     Add --peer-wings-public-port 8081 --peer-wings-target-port 8080 if this peer runs Wings."
 }
 
 install_vps1() {
@@ -2565,6 +2653,10 @@ install_vps1_add_peer() {
   if [[ -n "${PEER_WINGS_PUBLIC_PORT}" ]]; then
     info "Peer Wings forward:"
     info "  Forward: VPS1 ${PEER_WINGS_PUBLIC_PORT} -> ${PEER_NAME} ${WG_PEER_IP}:${PEER_WINGS_TARGET_PORT}"
+  fi
+  if [[ -n "${PEER_GAME_PORTS_RAW}" ]]; then
+    info "Peer Minecraft allocation forwards:"
+    info "  ${PEER_GAME_PORTS_RAW}"
   fi
 }
 
