@@ -15,12 +15,16 @@ VPS2_SSH_PORT=""
 IDENTITY_FILE=""
 PUBLIC_SSH_FORWARD_PORT=""
 WINGS_SCHEME=""
+WINGS_PUBLIC_PORT=""
+WINGS_TARGET_PORT=""
 GAME_PORTS_RAW=""
 INSTALL_CLIENT_HELPER="yes"
 PEER_NAME=""
 PEER_USER=""
 PEER_SSH_PORT=""
 PEER_PUBLIC_SSH_PORT=""
+PEER_WINGS_PUBLIC_PORT=""
+PEER_WINGS_TARGET_PORT=""
 
 WG_INTERFACE=""
 WG_PORT=""
@@ -30,6 +34,8 @@ WG_PEER_ADDRESS=""
 WG_VPS1_PUBLIC_KEY=""
 WG_VPS2_PUBLIC_KEY=""
 WG_PEER_PUBLIC_KEY=""
+WG_WATCHDOG_STALE_SECONDS=""
+WG_WATCHDOG_RESTART_ON_STALE=""
 WG_VPS1_IP=""
 WG_VPS2_IP=""
 WG_PEER_IP=""
@@ -63,13 +69,19 @@ DEFAULT_VPS2_SSH_PORT="22"
 DEFAULT_PEER_SSH_PORT="22"
 DEFAULT_PUBLIC_SSH_FORWARD_PORT="2222"
 DEFAULT_PEER_PUBLIC_SSH_PORT="2223"
+DEFAULT_PEER_WINGS_PUBLIC_PORT="8081"
+DEFAULT_PEER_WINGS_TARGET_PORT="8080"
 DEFAULT_WINGS_SCHEME="http"
+DEFAULT_WINGS_HTTP_PORT="8080"
+DEFAULT_WINGS_HTTPS_PORT="8443"
 DEFAULT_GAME_PORTS_RAW="25565"
 DEFAULT_WG_INTERFACE="cakessh-wg"
 DEFAULT_WG_PORT="51820"
 DEFAULT_WG_VPS1_ADDRESS="172.31.250.1/30"
 DEFAULT_WG_VPS2_ADDRESS="172.31.250.2/30"
 DEFAULT_WG_PEER_ADDRESS="172.31.250.3/32"
+DEFAULT_WG_WATCHDOG_STALE_SECONDS="1800"
+DEFAULT_WG_WATCHDOG_RESTART_ON_STALE="no"
 
 fail() {
   printf 'Error: %s\n' "$*" >&2
@@ -108,6 +120,7 @@ Usage:
   sudo bash install.sh show-key vps2
   sudo bash install.sh show-key peer
   sudo bash install.sh remove vps1
+  sudo bash install.sh remove peer
 
 Roles:
   client   Install the local `cakessh` helper only.
@@ -135,9 +148,14 @@ Optional flags:
   --peer-user root
   --peer-ssh-port 22
   --peer-public-ssh-port 2223
+  --peer-wings-public-port 8081
+  --peer-wings-target-port 8080
   --identity-file /path/to/key
   --public-ssh-port 2222
   --wings-scheme http|https
+  --wings-port 8080
+  --wings-public-port 8080
+  --wings-target-port 8080
   --game-ports 25565,25566,3000-4000
   --wg-interface cakessh-wg
   --wg-port 51820
@@ -147,6 +165,8 @@ Optional flags:
   --wg-vps1-public-key BASE64KEY
   --wg-vps2-public-key BASE64KEY
   --wg-peer-public-key BASE64KEY
+  --wg-watchdog-stale-seconds 1800
+  --wg-watchdog-restart-on-stale yes|no
   --no-client-helper
   --help
 
@@ -154,6 +174,7 @@ Uninstall:
   bash uninstall.sh client
   sudo bash uninstall.sh vps1
   sudo bash uninstall.sh vps2
+  sudo bash uninstall.sh peer
 
 Show WireGuard public keys:
   sudo bash install.sh show-key vps1
@@ -338,6 +359,16 @@ parse_args() {
         PEER_PUBLIC_SSH_PORT="$2"
         shift 2
         ;;
+      --peer-wings-public-port)
+        [[ $# -ge 2 ]] || fail "Missing value for --peer-wings-public-port"
+        PEER_WINGS_PUBLIC_PORT="$2"
+        shift 2
+        ;;
+      --peer-wings-target-port)
+        [[ $# -ge 2 ]] || fail "Missing value for --peer-wings-target-port"
+        PEER_WINGS_TARGET_PORT="$2"
+        shift 2
+        ;;
       --identity-file)
         [[ $# -ge 2 ]] || fail "Missing value for --identity-file"
         IDENTITY_FILE="$2"
@@ -351,6 +382,22 @@ parse_args() {
       --wings-scheme)
         [[ $# -ge 2 ]] || fail "Missing value for --wings-scheme"
         WINGS_SCHEME="$2"
+        shift 2
+        ;;
+      --wings-public-port)
+        [[ $# -ge 2 ]] || fail "Missing value for --wings-public-port"
+        WINGS_PUBLIC_PORT="$2"
+        shift 2
+        ;;
+      --wings-port)
+        [[ $# -ge 2 ]] || fail "Missing value for --wings-port"
+        WINGS_PUBLIC_PORT="$2"
+        WINGS_TARGET_PORT="${WINGS_TARGET_PORT:-$2}"
+        shift 2
+        ;;
+      --wings-target-port)
+        [[ $# -ge 2 ]] || fail "Missing value for --wings-target-port"
+        WINGS_TARGET_PORT="$2"
         shift 2
         ;;
       --game-ports)
@@ -398,6 +445,16 @@ parse_args() {
         WG_PEER_PUBLIC_KEY="$2"
         shift 2
         ;;
+      --wg-watchdog-stale-seconds)
+        [[ $# -ge 2 ]] || fail "Missing value for --wg-watchdog-stale-seconds"
+        WG_WATCHDOG_STALE_SECONDS="$2"
+        shift 2
+        ;;
+      --wg-watchdog-restart-on-stale)
+        [[ $# -ge 2 ]] || fail "Missing value for --wg-watchdog-restart-on-stale"
+        WG_WATCHDOG_RESTART_ON_STALE="$2"
+        shift 2
+        ;;
       --no-client-helper)
         INSTALL_CLIENT_HELPER="no"
         shift
@@ -439,13 +496,17 @@ prompt_role_if_needed() {
   while true; do
     case "${ACTION}" in
       remove)
-        read -r -p "What do you want to remove? (client/vps1/vps2/all) [vps1]: " reply
+        read -r -p "What do you want to remove? (client/vps1/vps2/peer/all) [vps1]: " reply
         reply="${reply:-vps1}"
-        if is_supported_role "${reply}"; then
-          ROLE="${reply}"
-          return 0
-        fi
-        info "Please choose client, vps1, vps2, or all."
+        case "${reply}" in
+          client|vps1|vps2|peer|all)
+            ROLE="${reply}"
+            return 0
+            ;;
+          *)
+            info "Please choose client, vps1, vps2, peer, or all."
+            ;;
+        esac
         ;;
       show-key)
         read -r -p "Which WireGuard public key do you want to show? (vps1/vps2/peer) [vps1]: " reply
@@ -504,6 +565,16 @@ validate_wings_scheme() {
   case "${WINGS_SCHEME}" in
     http|https) ;;
     *) fail "Wings scheme must be http or https, not ${WINGS_SCHEME}" ;;
+  esac
+}
+
+validate_yes_no() {
+  local value="$1"
+  local label="$2"
+
+  case "${value}" in
+    yes|no) ;;
+    *) fail "${label} must be yes or no, not ${value}" ;;
   esac
 }
 
@@ -642,12 +713,49 @@ apply_defaults() {
   PUBLIC_SSH_FORWARD_PORT="${PUBLIC_SSH_FORWARD_PORT:-${DEFAULT_PUBLIC_SSH_FORWARD_PORT}}"
   PEER_PUBLIC_SSH_PORT="${PEER_PUBLIC_SSH_PORT:-${DEFAULT_PEER_PUBLIC_SSH_PORT}}"
   WINGS_SCHEME="${WINGS_SCHEME:-${DEFAULT_WINGS_SCHEME}}"
+  WINGS_PUBLIC_PORT="${WINGS_PUBLIC_PORT:-$(default_wings_port)}"
+  WINGS_TARGET_PORT="${WINGS_TARGET_PORT:-$(default_wings_port)}"
   GAME_PORTS_RAW="${GAME_PORTS_RAW:-${DEFAULT_GAME_PORTS_RAW}}"
   WG_INTERFACE="${WG_INTERFACE:-${DEFAULT_WG_INTERFACE}}"
   WG_PORT="${WG_PORT:-${DEFAULT_WG_PORT}}"
   WG_VPS1_ADDRESS="${WG_VPS1_ADDRESS:-${DEFAULT_WG_VPS1_ADDRESS}}"
   WG_VPS2_ADDRESS="${WG_VPS2_ADDRESS:-${DEFAULT_WG_VPS2_ADDRESS}}"
   WG_PEER_ADDRESS="${WG_PEER_ADDRESS:-${DEFAULT_WG_PEER_ADDRESS}}"
+  WG_WATCHDOG_STALE_SECONDS="${WG_WATCHDOG_STALE_SECONDS:-${DEFAULT_WG_WATCHDOG_STALE_SECONDS}}"
+  WG_WATCHDOG_RESTART_ON_STALE="${WG_WATCHDOG_RESTART_ON_STALE:-${DEFAULT_WG_WATCHDOG_RESTART_ON_STALE}}"
+}
+
+default_wings_port() {
+  if [[ "${WINGS_SCHEME:-${DEFAULT_WINGS_SCHEME}}" == "https" ]]; then
+    printf '%s' "${DEFAULT_WINGS_HTTPS_PORT}"
+  else
+    printf '%s' "${DEFAULT_WINGS_HTTP_PORT}"
+  fi
+}
+
+normalize_wings_settings() {
+  apply_defaults
+  validate_wings_scheme
+  validate_port "${WINGS_PUBLIC_PORT}"
+  validate_port "${WINGS_TARGET_PORT}"
+}
+
+validate_peer_wings_settings() {
+  if [[ -z "${PEER_WINGS_PUBLIC_PORT}" && -z "${PEER_WINGS_TARGET_PORT}" ]]; then
+    return 0
+  fi
+
+  [[ -n "${PEER_WINGS_PUBLIC_PORT}" ]] || fail "Missing --peer-wings-public-port for peer Wings forwarding."
+  [[ -n "${PEER_WINGS_TARGET_PORT}" ]] || fail "Missing --peer-wings-target-port for peer Wings forwarding."
+  validate_port "${PEER_WINGS_PUBLIC_PORT}"
+  validate_port "${PEER_WINGS_TARGET_PORT}"
+}
+
+validate_wireguard_watchdog_settings() {
+  apply_defaults
+  [[ "${WG_WATCHDOG_STALE_SECONDS}" =~ ^[0-9]+$ ]] || fail "WireGuard watchdog stale seconds must be numeric: ${WG_WATCHDOG_STALE_SECONDS}"
+  ((10#${WG_WATCHDOG_STALE_SECONDS} >= 60)) || fail "WireGuard watchdog stale seconds must be at least 60."
+  validate_yes_no "${WG_WATCHDOG_RESTART_ON_STALE}" "--wg-watchdog-restart-on-stale"
 }
 
 normalize_wireguard_addresses() {
@@ -988,6 +1096,7 @@ config_file="/etc/cakessh/watchdog.env"
 : "${WG_INTERFACE:?WG_INTERFACE is required}"
 : "${WG_PEER_PUBLIC_KEY:?WG_PEER_PUBLIC_KEY is required}"
 : "${WG_MAX_STALE_SECONDS:?WG_MAX_STALE_SECONDS is required}"
+WG_RESTART_ON_STALE="${WG_RESTART_ON_STALE:-no}"
 
 WG_BIN="${WG_BIN:-$(command -v wg || true)}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-$(command -v systemctl || true)}"
@@ -998,15 +1107,19 @@ LOGGER_BIN="${LOGGER_BIN:-$(command -v logger || true)}"
 [[ -n "${SYSTEMCTL_BIN}" ]] || exit 0
 [[ -n "${DATE_BIN}" ]] || exit 0
 
-latest_handshake="$("${WG_BIN}" show "${WG_INTERFACE}" latest-handshakes 2>/dev/null | awk -v peer_key="${WG_PEER_PUBLIC_KEY}" '$1 == peer_key { print $2; exit }')"
-[[ -n "${latest_handshake}" ]] || latest_handshake="0"
-
-now="$("${DATE_BIN}" +%s)"
 restart_reason=""
-if [[ "${latest_handshake}" == "0" ]]; then
-  restart_reason="peer has no handshake"
-elif (( now - latest_handshake > WG_MAX_STALE_SECONDS )); then
-  restart_reason="latest handshake is stale"
+if ! "${WG_BIN}" show "${WG_INTERFACE}" >/dev/null 2>&1; then
+  restart_reason="interface is down"
+elif [[ "${WG_RESTART_ON_STALE}" == "yes" ]]; then
+  latest_handshake="$("${WG_BIN}" show "${WG_INTERFACE}" latest-handshakes 2>/dev/null | awk -v peer_key="${WG_PEER_PUBLIC_KEY}" '$1 == peer_key { print $2; exit }')"
+  [[ -n "${latest_handshake}" ]] || latest_handshake="0"
+
+  now="$("${DATE_BIN}" +%s)"
+  if [[ "${latest_handshake}" == "0" ]]; then
+    restart_reason="peer has no handshake"
+  elif (( now - latest_handshake > 10#${WG_MAX_STALE_SECONDS} )); then
+    restart_reason="latest handshake is stale"
+  fi
 fi
 
 if [[ -n "${restart_reason}" ]]; then
@@ -1028,7 +1141,8 @@ write_wireguard_watchdog_config() {
   {
     printf 'WG_INTERFACE=%q\n' "${WG_INTERFACE}"
     printf 'WG_PEER_PUBLIC_KEY=%q\n' "${peer_public_key}"
-    printf 'WG_MAX_STALE_SECONDS=%q\n' "180"
+    printf 'WG_MAX_STALE_SECONDS=%q\n' "${WG_WATCHDOG_STALE_SECONDS}"
+    printf 'WG_RESTART_ON_STALE=%q\n' "${WG_WATCHDOG_RESTART_ON_STALE}"
   } > "$(wireguard_watchdog_config_path)"
 
   chmod 0600 "$(wireguard_watchdog_config_path)"
@@ -1091,6 +1205,8 @@ remove_wireguard() {
   rm -f -- "$(wireguard_public_key_path "vps1")"
   rm -f -- "$(wireguard_private_key_path "vps2")"
   rm -f -- "$(wireguard_public_key_path "vps2")"
+  rm -f -- "$(wireguard_private_key_path "peer")"
+  rm -f -- "$(wireguard_public_key_path "peer")"
   rm -f -- "$(install_state_path)"
   rmdir "$(wireguard_state_dir)" 2>/dev/null || true
 }
@@ -1111,6 +1227,8 @@ load_install_state() {
   VPS2_SSH_PORT="${VPS2_SSH_PORT:-${STATE_VPS2_SSH_PORT:-}}"
   PUBLIC_SSH_FORWARD_PORT="${PUBLIC_SSH_FORWARD_PORT:-${STATE_PUBLIC_SSH_FORWARD_PORT:-}}"
   WINGS_SCHEME="${WINGS_SCHEME:-${STATE_WINGS_SCHEME:-}}"
+  WINGS_PUBLIC_PORT="${WINGS_PUBLIC_PORT:-${STATE_WINGS_PUBLIC_PORT:-}}"
+  WINGS_TARGET_PORT="${WINGS_TARGET_PORT:-${STATE_WINGS_TARGET_PORT:-}}"
   GAME_PORTS_RAW="${GAME_PORTS_RAW:-${STATE_GAME_PORTS_RAW:-}}"
   WG_INTERFACE="${WG_INTERFACE:-${STATE_WG_INTERFACE:-}}"
   WG_PORT="${WG_PORT:-${STATE_WG_PORT:-}}"
@@ -1118,6 +1236,8 @@ load_install_state() {
   WG_VPS2_ADDRESS="${WG_VPS2_ADDRESS:-${STATE_WG_VPS2_ADDRESS:-}}"
   WG_VPS1_PUBLIC_KEY="${WG_VPS1_PUBLIC_KEY:-${STATE_WG_VPS1_PUBLIC_KEY:-}}"
   WG_VPS2_PUBLIC_KEY="${WG_VPS2_PUBLIC_KEY:-${STATE_WG_VPS2_PUBLIC_KEY:-}}"
+  WG_WATCHDOG_STALE_SECONDS="${WG_WATCHDOG_STALE_SECONDS:-${STATE_WG_WATCHDOG_STALE_SECONDS:-}}"
+  WG_WATCHDOG_RESTART_ON_STALE="${WG_WATCHDOG_RESTART_ON_STALE:-${STATE_WG_WATCHDOG_RESTART_ON_STALE:-}}"
 }
 
 save_install_state() {
@@ -1134,6 +1254,8 @@ save_install_state() {
     printf 'STATE_VPS2_SSH_PORT=%q\n' "${VPS2_SSH_PORT}"
     printf 'STATE_PUBLIC_SSH_FORWARD_PORT=%q\n' "${PUBLIC_SSH_FORWARD_PORT}"
     printf 'STATE_WINGS_SCHEME=%q\n' "${WINGS_SCHEME}"
+    printf 'STATE_WINGS_PUBLIC_PORT=%q\n' "${WINGS_PUBLIC_PORT}"
+    printf 'STATE_WINGS_TARGET_PORT=%q\n' "${WINGS_TARGET_PORT}"
     printf 'STATE_GAME_PORTS_RAW=%q\n' "${GAME_PORTS_RAW}"
     printf 'STATE_WG_INTERFACE=%q\n' "${WG_INTERFACE}"
     printf 'STATE_WG_PORT=%q\n' "${WG_PORT}"
@@ -1141,6 +1263,8 @@ save_install_state() {
     printf 'STATE_WG_VPS2_ADDRESS=%q\n' "${WG_VPS2_ADDRESS}"
     printf 'STATE_WG_VPS1_PUBLIC_KEY=%q\n' "${WG_VPS1_PUBLIC_KEY}"
     printf 'STATE_WG_VPS2_PUBLIC_KEY=%q\n' "${WG_VPS2_PUBLIC_KEY}"
+    printf 'STATE_WG_WATCHDOG_STALE_SECONDS=%q\n' "${WG_WATCHDOG_STALE_SECONDS}"
+    printf 'STATE_WG_WATCHDOG_RESTART_ON_STALE=%q\n' "${WG_WATCHDOG_RESTART_ON_STALE}"
   } > "${state_path}"
 
   chmod 0600 "${state_path}"
@@ -1158,6 +1282,8 @@ save_ssh_peer_state() {
     printf 'SSH_PEER_USER=%q\n' "${PEER_USER}"
     printf 'SSH_PEER_SSH_PORT=%q\n' "${PEER_SSH_PORT}"
     printf 'SSH_PEER_PUBLIC_SSH_PORT=%q\n' "${PEER_PUBLIC_SSH_PORT}"
+    printf 'SSH_PEER_WINGS_PUBLIC_PORT=%q\n' "${PEER_WINGS_PUBLIC_PORT}"
+    printf 'SSH_PEER_WINGS_TARGET_PORT=%q\n' "${PEER_WINGS_TARGET_PORT}"
     printf 'SSH_PEER_WG_ADDRESS=%q\n' "${WG_PEER_ADDRESS}"
     printf 'SSH_PEER_WG_IP=%q\n' "${WG_PEER_IP}"
     printf 'SSH_PEER_PUBLIC_KEY=%q\n' "${WG_PEER_PUBLIC_KEY}"
@@ -1252,11 +1378,8 @@ ensure_port_is_free() {
 }
 
 calc_wings_port() {
-  if [[ "${WINGS_SCHEME}" == "https" ]]; then
-    printf '8443'
-  else
-    printf '8080'
-  fi
+  apply_defaults
+  printf '%s' "${WINGS_PUBLIC_PORT}"
 }
 
 join_by_comma() {
@@ -1921,14 +2044,13 @@ enable_relays() {
 }
 
 forwarded_public_port_specs() {
-  local wings_port=""
   local peer_file=""
   local SSH_PEER_PUBLIC_SSH_PORT=""
+  local SSH_PEER_WINGS_PUBLIC_PORT=""
   local -a port_specs=()
 
-  wings_port="$(calc_wings_port)"
   port_specs+=("${PUBLIC_SSH_FORWARD_PORT}")
-  port_specs+=("${wings_port}")
+  port_specs+=("${WINGS_PUBLIC_PORT}")
   port_specs+=("2022")
   port_specs+=("${GAME_PORT_RANGE_LIST[@]}")
 
@@ -1936,10 +2058,11 @@ forwarded_public_port_specs() {
     for peer_file in "$(ssh_peer_state_dir)"/*.env; do
       [[ -f "${peer_file}" ]] || continue
       SSH_PEER_PUBLIC_SSH_PORT=""
+      SSH_PEER_WINGS_PUBLIC_PORT=""
       # shellcheck disable=SC1090
       . "${peer_file}"
-      [[ -n "${SSH_PEER_PUBLIC_SSH_PORT}" ]] || continue
-      port_specs+=("${SSH_PEER_PUBLIC_SSH_PORT}")
+      [[ -n "${SSH_PEER_PUBLIC_SSH_PORT}" ]] && port_specs+=("${SSH_PEER_PUBLIC_SSH_PORT}")
+      [[ -n "${SSH_PEER_WINGS_PUBLIC_PORT}" ]] && port_specs+=("${SSH_PEER_WINGS_PUBLIC_PORT}")
     done
   fi
 
@@ -2056,13 +2179,15 @@ prompt_install_inputs() {
     fi
 
     if [[ -z "${WINGS_SCHEME}" ]]; then
-      if prompt_yes_no "Expose Wings over HTTPS on port 8443?" "n"; then
+      if prompt_yes_no "Expose Wings over HTTPS?" "n"; then
         WINGS_SCHEME="https"
       else
         WINGS_SCHEME="http"
       fi
     fi
 
+    prompt_value WINGS_PUBLIC_PORT "Public Wings port on VPS1" "$(default_wings_port)"
+    prompt_value WINGS_TARGET_PORT "Wings port on VPS2" "$(default_wings_port)"
     prompt_value GAME_PORTS_RAW "Game TCP ports to forward (comma-separated)" "${DEFAULT_GAME_PORTS_RAW}"
   fi
 
@@ -2092,12 +2217,18 @@ prompt_install_inputs() {
     prompt_value WG_PORT "WireGuard UDP port on VPS1" "${DEFAULT_WG_PORT}"
     prompt_value WG_VPS1_ADDRESS "VPS1 WireGuard address" "${DEFAULT_WG_VPS1_ADDRESS}"
     prompt_value WG_PEER_ADDRESS "Peer WireGuard address" "${DEFAULT_WG_PEER_ADDRESS}"
+    if [[ -z "${PEER_WINGS_PUBLIC_PORT}" && -z "${PEER_WINGS_TARGET_PORT}" ]] && prompt_yes_no "Forward Pterodactyl Wings to this peer?" "n"; then
+      prompt_value PEER_WINGS_PUBLIC_PORT "Public Wings port on VPS1 for this peer" "${DEFAULT_PEER_WINGS_PUBLIC_PORT}"
+      prompt_value PEER_WINGS_TARGET_PORT "Wings port on this peer" "${DEFAULT_PEER_WINGS_TARGET_PORT}"
+    elif [[ -n "${PEER_WINGS_PUBLIC_PORT}" || -n "${PEER_WINGS_TARGET_PORT}" ]]; then
+      prompt_value PEER_WINGS_PUBLIC_PORT "Public Wings port on VPS1 for this peer" "${DEFAULT_PEER_WINGS_PUBLIC_PORT}"
+      prompt_value PEER_WINGS_TARGET_PORT "Wings port on this peer" "${DEFAULT_PEER_WINGS_TARGET_PORT}"
+    fi
     prompt_value WG_PEER_PUBLIC_KEY "Peer WireGuard public key (run: sudo bash install.sh show-key peer on the peer)" ""
   fi
 }
 
 prepare_relay_plan() {
-  local wings_port=""
   local game_port_spec=""
   local game_rule_name=""
 
@@ -2111,10 +2242,9 @@ prepare_relay_plan() {
   RELAY_LISTEN_PORTS=()
   RELAY_TARGET_PORTS=()
   RELAY_DESCRIPTIONS=()
-  wings_port="$(calc_wings_port)"
 
   add_forward_rule "ssh-vps2" "${PUBLIC_SSH_FORWARD_PORT}" "${VPS2_SSH_PORT}" "Direct SSH to VPS2 over WireGuard"
-  add_forward_rule "wings" "${wings_port}" "${wings_port}" "Pterodactyl Wings over WireGuard"
+  add_forward_rule "wings" "${WINGS_PUBLIC_PORT}" "${WINGS_TARGET_PORT}" "Pterodactyl Wings over WireGuard"
   add_forward_rule "sftp" "2022" "2022" "Pterodactyl SFTP over WireGuard"
 
   for game_port_spec in "${GAME_PORT_RANGE_LIST[@]}"; do
@@ -2131,6 +2261,8 @@ add_extra_ssh_peer_forward_rules() {
   local SSH_PEER_WG_IP=""
   local SSH_PEER_PUBLIC_SSH_PORT=""
   local SSH_PEER_SSH_PORT=""
+  local SSH_PEER_WINGS_PUBLIC_PORT=""
+  local SSH_PEER_WINGS_TARGET_PORT=""
 
   [[ -d "$(ssh_peer_state_dir)" ]] || return 0
 
@@ -2140,11 +2272,17 @@ add_extra_ssh_peer_forward_rules() {
     SSH_PEER_WG_IP=""
     SSH_PEER_PUBLIC_SSH_PORT=""
     SSH_PEER_SSH_PORT=""
+    SSH_PEER_WINGS_PUBLIC_PORT=""
+    SSH_PEER_WINGS_TARGET_PORT=""
     # shellcheck disable=SC1090
     . "${peer_file}"
     [[ -n "${SSH_PEER_NAME}" && -n "${SSH_PEER_WG_IP}" && -n "${SSH_PEER_PUBLIC_SSH_PORT}" ]] || continue
     SSH_PEER_SSH_PORT="${SSH_PEER_SSH_PORT:-22}"
     add_forward_rule_to_host "${SSH_PEER_WG_IP}" "ssh-${SSH_PEER_NAME}" "${SSH_PEER_PUBLIC_SSH_PORT}" "${SSH_PEER_SSH_PORT}" "Direct SSH to ${SSH_PEER_NAME} over WireGuard"
+    if [[ -n "${SSH_PEER_WINGS_PUBLIC_PORT}" || -n "${SSH_PEER_WINGS_TARGET_PORT}" ]]; then
+      [[ -n "${SSH_PEER_WINGS_PUBLIC_PORT}" && -n "${SSH_PEER_WINGS_TARGET_PORT}" ]] || fail "Peer ${SSH_PEER_NAME} has incomplete Wings forwarding state."
+      add_forward_rule_to_host "${SSH_PEER_WG_IP}" "wings-${SSH_PEER_NAME}" "${SSH_PEER_WINGS_PUBLIC_PORT}" "${SSH_PEER_WINGS_TARGET_PORT}" "Pterodactyl Wings to ${SSH_PEER_NAME} over WireGuard"
+    fi
   done
 }
 
@@ -2155,7 +2293,7 @@ validate_client_inputs() {
   validate_port "${VPS1_SSH_PORT}"
   validate_port "${VPS2_SSH_PORT}"
   validate_port "${PUBLIC_SSH_FORWARD_PORT}"
-  validate_wings_scheme
+  normalize_wings_settings
   normalize_game_ports
   validate_identity_file_if_present
 }
@@ -2168,7 +2306,8 @@ validate_vps1_inputs() {
   validate_port "${VPS2_SSH_PORT}"
   validate_port "${PUBLIC_SSH_FORWARD_PORT}"
   validate_port "${WG_PORT}"
-  validate_wings_scheme
+  normalize_wings_settings
+  validate_wireguard_watchdog_settings
   normalize_game_ports
   validate_wireguard_public_key_if_present "${WG_VPS2_PUBLIC_KEY}"
 }
@@ -2179,6 +2318,7 @@ validate_vps2_inputs() {
   validate_ipv4_basic "${VPS1_IPV4}"
   ensure_local_wireguard_ip_available "${WG_VPS2_IP}"
   validate_port "${WG_PORT}"
+  validate_wireguard_watchdog_settings
   validate_wireguard_public_key_if_present "${WG_VPS1_PUBLIC_KEY}"
   [[ -n "${WG_VPS1_PUBLIC_KEY}" ]] || fail "VPS2 install needs the VPS1 public key. On VPS1 run: sudo bash install.sh show-key vps1"
 }
@@ -2190,6 +2330,7 @@ validate_peer_inputs() {
   validate_ipv4_basic "${VPS1_IPV4}"
   ensure_local_wireguard_ip_available "${WG_PEER_IP}"
   validate_port "${WG_PORT}"
+  validate_wireguard_watchdog_settings
   validate_wireguard_public_key_if_present "${WG_VPS1_PUBLIC_KEY}"
   [[ -n "${WG_VPS1_PUBLIC_KEY}" ]] || fail "Peer install needs the VPS1 public key. On VPS1 run: sudo bash install.sh show-key vps1"
 }
@@ -2204,7 +2345,9 @@ validate_vps1_add_peer_inputs() {
   validate_port "${PEER_SSH_PORT}"
   validate_port "${PEER_PUBLIC_SSH_PORT}"
   validate_port "${WG_PORT}"
-  validate_wings_scheme
+  normalize_wings_settings
+  validate_peer_wings_settings
+  validate_wireguard_watchdog_settings
   normalize_game_ports
   validate_wireguard_public_key_if_present "${WG_PEER_PUBLIC_KEY}"
   [[ -n "${WG_PEER_PUBLIC_KEY}" ]] || fail "VPS1 add-peer needs the peer public key. On the peer run: sudo bash install.sh show-key peer"
@@ -2328,6 +2471,7 @@ install_vps1() {
     info "Wings:"
     info "  curl http://${VPS1_IPV4}:${wings_port}"
   fi
+  info "  Forward: VPS1 ${WINGS_PUBLIC_PORT} -> VPS2 ${WG_VPS2_IP}:${WINGS_TARGET_PORT}"
   info "SFTP:"
   info "  sftp -P 2022 ${VPS2_USER}@${VPS1_IPV4}"
   info "Minecraft test:"
@@ -2418,6 +2562,10 @@ install_vps1_add_peer() {
   info "Added ${PEER_NAME} to VPS1."
   info "Direct SSH:"
   info "  ssh -p ${PEER_PUBLIC_SSH_PORT} ${PEER_USER}@${VPS1_IPV4}"
+  if [[ -n "${PEER_WINGS_PUBLIC_PORT}" ]]; then
+    info "Peer Wings forward:"
+    info "  Forward: VPS1 ${PEER_WINGS_PUBLIC_PORT} -> ${PEER_NAME} ${WG_PEER_IP}:${PEER_WINGS_TARGET_PORT}"
+  fi
 }
 
 remove_client() {
@@ -2477,6 +2625,14 @@ remove_vps2() {
   info "Removed WireGuard from VPS2."
 }
 
+remove_peer() {
+  require_root
+  progress 1 2 "Removing WireGuard from peer"
+  remove_wireguard
+  progress 2 2 "Peer uninstall finished"
+  info "Removed WireGuard from peer."
+}
+
 show_public_key() {
   local key_path=""
 
@@ -2517,6 +2673,9 @@ run_remove() {
       ;;
     vps2)
       remove_vps2
+      ;;
+    peer)
+      remove_peer
       ;;
     all)
       remove_client

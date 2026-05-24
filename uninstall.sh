@@ -18,6 +18,7 @@ Usage:
   bash uninstall.sh client
   sudo bash uninstall.sh vps1
   sudo bash uninstall.sh vps2
+  sudo bash uninstall.sh peer
   sudo bash uninstall.sh all
 EOF
 }
