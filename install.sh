@@ -17,15 +17,22 @@ PUBLIC_SSH_FORWARD_PORT=""
 WINGS_SCHEME=""
 GAME_PORTS_RAW=""
 INSTALL_CLIENT_HELPER="yes"
+PEER_NAME=""
+PEER_USER=""
+PEER_SSH_PORT=""
+PEER_PUBLIC_SSH_PORT=""
 
 WG_INTERFACE=""
 WG_PORT=""
 WG_VPS1_ADDRESS=""
 WG_VPS2_ADDRESS=""
+WG_PEER_ADDRESS=""
 WG_VPS1_PUBLIC_KEY=""
 WG_VPS2_PUBLIC_KEY=""
+WG_PEER_PUBLIC_KEY=""
 WG_VPS1_IP=""
 WG_VPS2_IP=""
+WG_PEER_IP=""
 VPS2_HOST=""
 
 CLIENT_INSTALL_USER=""
@@ -40,6 +47,7 @@ RELAY_TARGET_PORTS=()
 RELAY_DESCRIPTIONS=()
 FORWARD_RULE_NAMES=()
 FORWARD_RULE_LISTEN_SPECS=()
+FORWARD_RULE_TARGET_HOSTS=()
 FORWARD_RULE_TARGET_SPECS=()
 FORWARD_RULE_DESCRIPTIONS=()
 FORWARD_LISTEN_PORT_CHECKS=()
@@ -49,15 +57,19 @@ GAME_PORTS_CANONICAL=""
 
 DEFAULT_VPS1_USER="root"
 DEFAULT_VPS2_USER="root"
+DEFAULT_PEER_USER="root"
 DEFAULT_VPS1_SSH_PORT="22"
 DEFAULT_VPS2_SSH_PORT="22"
+DEFAULT_PEER_SSH_PORT="22"
 DEFAULT_PUBLIC_SSH_FORWARD_PORT="2222"
+DEFAULT_PEER_PUBLIC_SSH_PORT="2223"
 DEFAULT_WINGS_SCHEME="http"
 DEFAULT_GAME_PORTS_RAW="25565"
 DEFAULT_WG_INTERFACE="cakessh-wg"
 DEFAULT_WG_PORT="51820"
 DEFAULT_WG_VPS1_ADDRESS="172.31.250.1/30"
 DEFAULT_WG_VPS2_ADDRESS="172.31.250.2/30"
+DEFAULT_WG_PEER_ADDRESS="172.31.250.3/32"
 
 fail() {
   printf 'Error: %s\n' "$*" >&2
@@ -89,15 +101,21 @@ Usage:
   bash install.sh client
   sudo bash install.sh vps1
   sudo bash install.sh vps2
+  sudo bash install.sh peer
+  sudo bash install.sh vps1-add-peer
   sudo bash install.sh all
   sudo bash install.sh show-key vps1
   sudo bash install.sh show-key vps2
+  sudo bash install.sh show-key peer
   sudo bash install.sh remove vps1
 
 Roles:
   client   Install the local `cakessh` helper only.
   vps1     Install WireGuard on VPS1 and, once VPS2's public key is known, install the TCP forwarder.
   vps2     Install WireGuard on VPS2 so it auto-connects back to VPS1.
+  peer     Install WireGuard on an extra SSH-only backend VPS, such as VPS3 or VPS4.
+  vps1-add-peer
+           Add an extra SSH-only backend VPS to VPS1 with its own public SSH port.
   all      Run the VPS1 flow and also install the local `cakessh` helper.
 
 Client extras:
@@ -113,6 +131,10 @@ Optional flags:
   --vps1-ssh-port 22
   --vps2-user root
   --vps2-ssh-port 22
+  --peer-name vps3
+  --peer-user root
+  --peer-ssh-port 22
+  --peer-public-ssh-port 2223
   --identity-file /path/to/key
   --public-ssh-port 2222
   --wings-scheme http|https
@@ -121,8 +143,10 @@ Optional flags:
   --wg-port 51820
   --wg-vps1-address 10.0.0.1/24
   --wg-vps2-address 10.0.0.2/24
+  --wg-peer-address 172.31.250.3/32
   --wg-vps1-public-key BASE64KEY
   --wg-vps2-public-key BASE64KEY
+  --wg-peer-public-key BASE64KEY
   --no-client-helper
   --help
 
@@ -134,6 +158,7 @@ Uninstall:
 Show WireGuard public keys:
   sudo bash install.sh show-key vps1
   sudo bash install.sh show-key vps2
+  sudo bash install.sh show-key peer
 EOF
 }
 
@@ -222,7 +247,7 @@ detect_primary_ipv4() {
 
 is_supported_role() {
   case "$1" in
-    client|vps1|vps2|all) return 0 ;;
+    client|vps1|vps2|peer|vps1-add-peer|all) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -244,7 +269,12 @@ parse_args() {
         ROLE="vps2"
         shift
         ;;
-      client|vps1|vps2|all)
+      show-peer-key)
+        ACTION="show-key"
+        ROLE="peer"
+        shift
+        ;;
+      client|vps1|vps2|peer|vps1-add-peer|all)
         [[ -z "${ROLE}" ]] || fail "Role already set to ${ROLE}"
         ROLE="$1"
         shift
@@ -288,6 +318,26 @@ parse_args() {
         VPS2_SSH_PORT="$2"
         shift 2
         ;;
+      --peer-name)
+        [[ $# -ge 2 ]] || fail "Missing value for --peer-name"
+        PEER_NAME="$2"
+        shift 2
+        ;;
+      --peer-user)
+        [[ $# -ge 2 ]] || fail "Missing value for --peer-user"
+        PEER_USER="$2"
+        shift 2
+        ;;
+      --peer-ssh-port)
+        [[ $# -ge 2 ]] || fail "Missing value for --peer-ssh-port"
+        PEER_SSH_PORT="$2"
+        shift 2
+        ;;
+      --peer-public-ssh-port|--public-peer-ssh-port)
+        [[ $# -ge 2 ]] || fail "Missing value for --peer-public-ssh-port"
+        PEER_PUBLIC_SSH_PORT="$2"
+        shift 2
+        ;;
       --identity-file)
         [[ $# -ge 2 ]] || fail "Missing value for --identity-file"
         IDENTITY_FILE="$2"
@@ -328,6 +378,11 @@ parse_args() {
         WG_VPS2_ADDRESS="$2"
         shift 2
         ;;
+      --wg-peer-address)
+        [[ $# -ge 2 ]] || fail "Missing value for --wg-peer-address"
+        WG_PEER_ADDRESS="$2"
+        shift 2
+        ;;
       --wg-vps1-public-key)
         [[ $# -ge 2 ]] || fail "Missing value for --wg-vps1-public-key"
         WG_VPS1_PUBLIC_KEY="$2"
@@ -336,6 +391,11 @@ parse_args() {
       --wg-vps2-public-key)
         [[ $# -ge 2 ]] || fail "Missing value for --wg-vps2-public-key"
         WG_VPS2_PUBLIC_KEY="$2"
+        shift 2
+        ;;
+      --wg-peer-public-key)
+        [[ $# -ge 2 ]] || fail "Missing value for --wg-peer-public-key"
+        WG_PEER_PUBLIC_KEY="$2"
         shift 2
         ;;
       --no-client-helper)
@@ -388,26 +448,26 @@ prompt_role_if_needed() {
         info "Please choose client, vps1, vps2, or all."
         ;;
       show-key)
-        read -r -p "Which WireGuard public key do you want to show? (vps1/vps2) [vps1]: " reply
+        read -r -p "Which WireGuard public key do you want to show? (vps1/vps2/peer) [vps1]: " reply
         reply="${reply:-vps1}"
         case "${reply}" in
-          vps1|vps2)
+          vps1|vps2|peer)
             ROLE="${reply}"
             return 0
             ;;
           *)
-            info "Please choose vps1 or vps2."
+            info "Please choose vps1, vps2, or peer."
             ;;
         esac
         ;;
       *)
-        read -r -p "Which role do you want to install? (client/vps1/vps2/all) [all]: " reply
+        read -r -p "Which role do you want to install? (client/vps1/vps2/peer/vps1-add-peer/all) [all]: " reply
         reply="${reply:-all}"
         if is_supported_role "${reply}"; then
           ROLE="${reply}"
           return 0
         fi
-        info "Please choose client, vps1, vps2, or all."
+        info "Please choose client, vps1, vps2, peer, vps1-add-peer, or all."
         ;;
     esac
   done
@@ -575,27 +635,39 @@ validate_wireguard_public_key_if_present() {
 apply_defaults() {
   VPS1_USER="${VPS1_USER:-${DEFAULT_VPS1_USER}}"
   VPS2_USER="${VPS2_USER:-${DEFAULT_VPS2_USER}}"
+  PEER_USER="${PEER_USER:-${DEFAULT_PEER_USER}}"
   VPS1_SSH_PORT="${VPS1_SSH_PORT:-${DEFAULT_VPS1_SSH_PORT}}"
   VPS2_SSH_PORT="${VPS2_SSH_PORT:-${DEFAULT_VPS2_SSH_PORT}}"
+  PEER_SSH_PORT="${PEER_SSH_PORT:-${DEFAULT_PEER_SSH_PORT}}"
   PUBLIC_SSH_FORWARD_PORT="${PUBLIC_SSH_FORWARD_PORT:-${DEFAULT_PUBLIC_SSH_FORWARD_PORT}}"
+  PEER_PUBLIC_SSH_PORT="${PEER_PUBLIC_SSH_PORT:-${DEFAULT_PEER_PUBLIC_SSH_PORT}}"
   WINGS_SCHEME="${WINGS_SCHEME:-${DEFAULT_WINGS_SCHEME}}"
   GAME_PORTS_RAW="${GAME_PORTS_RAW:-${DEFAULT_GAME_PORTS_RAW}}"
   WG_INTERFACE="${WG_INTERFACE:-${DEFAULT_WG_INTERFACE}}"
   WG_PORT="${WG_PORT:-${DEFAULT_WG_PORT}}"
   WG_VPS1_ADDRESS="${WG_VPS1_ADDRESS:-${DEFAULT_WG_VPS1_ADDRESS}}"
   WG_VPS2_ADDRESS="${WG_VPS2_ADDRESS:-${DEFAULT_WG_VPS2_ADDRESS}}"
+  WG_PEER_ADDRESS="${WG_PEER_ADDRESS:-${DEFAULT_WG_PEER_ADDRESS}}"
 }
 
 normalize_wireguard_addresses() {
   apply_defaults
   validate_ipv4_cidr "${WG_VPS1_ADDRESS}"
   validate_ipv4_cidr "${WG_VPS2_ADDRESS}"
+  validate_ipv4_cidr "${WG_PEER_ADDRESS}"
 
   WG_VPS1_IP="${WG_VPS1_ADDRESS%%/*}"
   WG_VPS2_IP="${WG_VPS2_ADDRESS%%/*}"
+  WG_PEER_IP="${WG_PEER_ADDRESS%%/*}"
   VPS2_HOST="${WG_VPS2_IP}"
 
   [[ "${WG_VPS1_IP}" != "${WG_VPS2_IP}" ]] || fail "VPS1 and VPS2 WireGuard IPs must be different."
+  [[ "${WG_VPS1_IP}" != "${WG_PEER_IP}" ]] || fail "VPS1 and peer WireGuard IPs must be different."
+}
+
+validate_peer_name() {
+  [[ -n "${PEER_NAME}" ]] || fail "Missing peer name. Use --peer-name vps3"
+  [[ "${PEER_NAME}" =~ ^[A-Za-z0-9_-]+$ ]] || fail "Peer name can only contain letters, numbers, underscore, and dash."
 }
 
 find_local_ip_conflict_interface() {
@@ -736,6 +808,22 @@ wireguard_service_name() {
   printf 'wg-quick@%s.service' "${WG_INTERFACE}"
 }
 
+wireguard_watchdog_config_path() {
+  printf '/etc/cakessh/watchdog.env'
+}
+
+wireguard_watchdog_script_path() {
+  printf '/usr/local/lib/cakessh/cakessh-wg-watchdog'
+}
+
+wireguard_watchdog_service_name() {
+  printf 'cakessh-wg-watchdog.service'
+}
+
+wireguard_watchdog_timer_name() {
+  printf 'cakessh-wg-watchdog.timer'
+}
+
 wireguard_private_key_path() {
   local node_role="$1"
   printf '%s/%s.privatekey' "$(wireguard_state_dir)" "${node_role}"
@@ -748,6 +836,15 @@ wireguard_public_key_path() {
 
 install_state_path() {
   printf '/etc/cakessh/install.env'
+}
+
+ssh_peer_state_dir() {
+  printf '/etc/cakessh/ssh-peers'
+}
+
+ssh_peer_state_path() {
+  local peer_name="$1"
+  printf '%s/%s.env' "$(ssh_peer_state_dir)" "${peer_name}"
 }
 
 forwarder_service_name() {
@@ -797,6 +894,8 @@ write_vps1_wireguard_config() {
       printf 'PublicKey = %s\n' "${WG_VPS2_PUBLIC_KEY}"
       printf 'AllowedIPs = %s/32\n' "${WG_VPS2_IP}"
     fi
+
+    print_extra_wireguard_peer_blocks
   } > "${config_path}"
 
   chmod 0600 "${config_path}"
@@ -821,6 +920,48 @@ write_vps2_wireguard_config() {
   chmod 0600 "${config_path}"
 }
 
+write_peer_wireguard_config() {
+  local config_path
+  config_path="$(wireguard_config_path)"
+
+  umask 077
+  {
+    printf '[Interface]\n'
+    printf 'Address = %s\n' "${WG_PEER_ADDRESS}"
+    printf 'PrivateKey = %s\n' "${LOCAL_WG_PRIVATE_KEY}"
+    printf '\n[Peer]\n'
+    printf 'PublicKey = %s\n' "${WG_VPS1_PUBLIC_KEY}"
+    printf 'AllowedIPs = %s/32\n' "${WG_VPS1_IP}"
+    printf 'Endpoint = %s:%s\n' "${VPS1_IPV4}" "${WG_PORT}"
+    printf 'PersistentKeepalive = 25\n'
+  } > "${config_path}"
+
+  chmod 0600 "${config_path}"
+}
+
+print_extra_wireguard_peer_blocks() {
+  local peer_file=""
+  local SSH_PEER_NAME=""
+  local SSH_PEER_WG_IP=""
+  local SSH_PEER_PUBLIC_KEY=""
+
+  [[ -d "$(ssh_peer_state_dir)" ]] || return 0
+
+  for peer_file in "$(ssh_peer_state_dir)"/*.env; do
+    [[ -f "${peer_file}" ]] || continue
+    SSH_PEER_NAME=""
+    SSH_PEER_WG_IP=""
+    SSH_PEER_PUBLIC_KEY=""
+    # shellcheck disable=SC1090
+    . "${peer_file}"
+    [[ -n "${SSH_PEER_WG_IP}" && -n "${SSH_PEER_PUBLIC_KEY}" ]] || continue
+    printf '\n[Peer]\n'
+    printf '# %s\n' "${SSH_PEER_NAME:-extra-peer}"
+    printf 'PublicKey = %s\n' "${SSH_PEER_PUBLIC_KEY}"
+    printf 'AllowedIPs = %s/32\n' "${SSH_PEER_WG_IP}"
+  done
+}
+
 upsert_wireguard_service() {
   local service_name
   service_name="$(wireguard_service_name)"
@@ -830,12 +971,120 @@ upsert_wireguard_service() {
   systemctl is-active --quiet "${service_name}" || fail "WireGuard service failed to start: ${service_name}"
 }
 
+write_wireguard_watchdog_script() {
+  mkdir -p /usr/local/lib/cakessh
+
+  cat > "$(wireguard_watchdog_script_path)" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+config_file="/etc/cakessh/watchdog.env"
+
+[[ -f "${config_file}" ]] || exit 0
+
+# shellcheck disable=SC1090
+. "${config_file}"
+
+: "${WG_INTERFACE:?WG_INTERFACE is required}"
+: "${WG_PEER_PUBLIC_KEY:?WG_PEER_PUBLIC_KEY is required}"
+: "${WG_MAX_STALE_SECONDS:?WG_MAX_STALE_SECONDS is required}"
+
+WG_BIN="${WG_BIN:-$(command -v wg || true)}"
+SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-$(command -v systemctl || true)}"
+DATE_BIN="${DATE_BIN:-$(command -v date || true)}"
+LOGGER_BIN="${LOGGER_BIN:-$(command -v logger || true)}"
+
+[[ -n "${WG_BIN}" ]] || exit 0
+[[ -n "${SYSTEMCTL_BIN}" ]] || exit 0
+[[ -n "${DATE_BIN}" ]] || exit 0
+
+latest_handshake="$("${WG_BIN}" show "${WG_INTERFACE}" latest-handshakes 2>/dev/null | awk -v peer_key="${WG_PEER_PUBLIC_KEY}" '$1 == peer_key { print $2; exit }')"
+[[ -n "${latest_handshake}" ]] || latest_handshake="0"
+
+now="$("${DATE_BIN}" +%s)"
+restart_reason=""
+if [[ "${latest_handshake}" == "0" ]]; then
+  restart_reason="peer has no handshake"
+elif (( now - latest_handshake > WG_MAX_STALE_SECONDS )); then
+  restart_reason="latest handshake is stale"
+fi
+
+if [[ -n "${restart_reason}" ]]; then
+  if [[ -n "${LOGGER_BIN}" ]]; then
+    "${LOGGER_BIN}" -t cakessh-wg-watchdog "Restarting ${WG_INTERFACE}: ${restart_reason}."
+  fi
+  "${SYSTEMCTL_BIN}" restart "wg-quick@${WG_INTERFACE}.service"
+fi
+EOF
+
+  chmod 0755 "$(wireguard_watchdog_script_path)"
+}
+
+write_wireguard_watchdog_config() {
+  local peer_public_key="$1"
+
+  mkdir -p /etc/cakessh
+
+  {
+    printf 'WG_INTERFACE=%q\n' "${WG_INTERFACE}"
+    printf 'WG_PEER_PUBLIC_KEY=%q\n' "${peer_public_key}"
+    printf 'WG_MAX_STALE_SECONDS=%q\n' "180"
+  } > "$(wireguard_watchdog_config_path)"
+
+  chmod 0600 "$(wireguard_watchdog_config_path)"
+}
+
+write_wireguard_watchdog_unit() {
+  cat > "/etc/systemd/system/$(wireguard_watchdog_service_name)" <<EOF
+[Unit]
+Description=cakessh WireGuard watchdog
+After=$(wireguard_service_name)
+Wants=$(wireguard_service_name)
+
+[Service]
+Type=oneshot
+ExecStart=$(wireguard_watchdog_script_path)
+NoNewPrivileges=true
+EOF
+
+  cat > "/etc/systemd/system/$(wireguard_watchdog_timer_name)" <<EOF
+[Unit]
+Description=Run cakessh WireGuard watchdog every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Unit=$(wireguard_watchdog_service_name)
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+upsert_wireguard_watchdog() {
+  systemctl daemon-reload
+  systemctl enable --now "$(wireguard_watchdog_timer_name)"
+  systemctl restart "$(wireguard_watchdog_timer_name)"
+  systemctl is-active --quiet "$(wireguard_watchdog_timer_name)" || fail "WireGuard watchdog timer failed to start: $(wireguard_watchdog_timer_name)"
+}
+
+remove_wireguard_watchdog() {
+  systemctl disable --now "$(wireguard_watchdog_timer_name)" >/dev/null 2>&1 || true
+  systemctl disable --now "$(wireguard_watchdog_service_name)" >/dev/null 2>&1 || true
+  rm -f -- "/etc/systemd/system/$(wireguard_watchdog_service_name)"
+  rm -f -- "/etc/systemd/system/$(wireguard_watchdog_timer_name)"
+  rm -f -- "$(wireguard_watchdog_config_path)"
+  rm -f -- "$(wireguard_watchdog_script_path)"
+}
+
 remove_wireguard() {
   local service_name
 
   apply_defaults
   service_name="$(wireguard_service_name)"
 
+  remove_wireguard_watchdog
   systemctl disable --now "${service_name}" >/dev/null 2>&1 || true
   rm -f -- "$(wireguard_config_path)"
   rm -f -- "$(wireguard_private_key_path "vps1")"
@@ -892,6 +1141,26 @@ save_install_state() {
     printf 'STATE_WG_VPS2_ADDRESS=%q\n' "${WG_VPS2_ADDRESS}"
     printf 'STATE_WG_VPS1_PUBLIC_KEY=%q\n' "${WG_VPS1_PUBLIC_KEY}"
     printf 'STATE_WG_VPS2_PUBLIC_KEY=%q\n' "${WG_VPS2_PUBLIC_KEY}"
+  } > "${state_path}"
+
+  chmod 0600 "${state_path}"
+}
+
+save_ssh_peer_state() {
+  local state_path=""
+
+  validate_peer_name
+  state_path="$(ssh_peer_state_path "${PEER_NAME}")"
+  mkdir -p "$(ssh_peer_state_dir)"
+
+  {
+    printf 'SSH_PEER_NAME=%q\n' "${PEER_NAME}"
+    printf 'SSH_PEER_USER=%q\n' "${PEER_USER}"
+    printf 'SSH_PEER_SSH_PORT=%q\n' "${PEER_SSH_PORT}"
+    printf 'SSH_PEER_PUBLIC_SSH_PORT=%q\n' "${PEER_PUBLIC_SSH_PORT}"
+    printf 'SSH_PEER_WG_ADDRESS=%q\n' "${WG_PEER_ADDRESS}"
+    printf 'SSH_PEER_WG_IP=%q\n' "${WG_PEER_IP}"
+    printf 'SSH_PEER_PUBLIC_KEY=%q\n' "${WG_PEER_PUBLIC_KEY}"
   } > "${state_path}"
 
   chmod 0600 "${state_path}"
@@ -1224,6 +1493,12 @@ iptables_port_spec() {
 }
 
 add_forward_rule() {
+  add_forward_rule_to_host "${WG_VPS2_IP}" "$@"
+}
+
+add_forward_rule_to_host() {
+  local target_host="$1"
+  shift
   local name="$1"
   local listen_spec="$2"
   local target_spec="$3"
@@ -1247,6 +1522,7 @@ add_forward_rule() {
 
   FORWARD_RULE_NAMES+=("${name}")
   FORWARD_RULE_LISTEN_SPECS+=("${listen_spec}")
+  FORWARD_RULE_TARGET_HOSTS+=("${target_host}")
   FORWARD_RULE_TARGET_SPECS+=("${target_spec}")
   FORWARD_RULE_DESCRIPTIONS+=("${description}")
 }
@@ -1434,8 +1710,10 @@ install_rules() {
   local rule_value=""
   local name=""
   local listen_spec=""
+  local target_host=""
   local target_spec=""
   local description=""
+  local maybe_description=""
   local listen_iptables_spec=""
   local target_iptables_spec=""
   local target_destination=""
@@ -1447,25 +1725,31 @@ install_rules() {
   ensure_chain filter CAKESSH_FORWARD
 
   "${IPTABLES_BIN}" -t filter -A CAKESSH_FORWARD -i "${WG_INTERFACE}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  "${IPTABLES_BIN}" -t nat -A CAKESSH_SNAT -o "${WG_INTERFACE}" -p tcp -d "${WG_VPS2_IP}" -j MASQUERADE
 
   for ((index = 1; index <= FORWARD_RULE_COUNT; index++)); do
     rule_var="FORWARD_RULE_${index}"
     rule_value="${!rule_var:-}"
     [[ -n "${rule_value}" ]] || continue
 
-    IFS='|' read -r name listen_spec target_spec description <<< "${rule_value}"
+    IFS='|' read -r name listen_spec target_host target_spec description maybe_description <<< "${rule_value}"
+    if [[ -z "${description}" ]]; then
+      description="${target_spec}"
+      target_spec="${target_host}"
+      target_host="${WG_VPS2_IP}"
+    fi
+
     listen_iptables_spec="$(to_iptables_spec "${listen_spec}")"
     target_iptables_spec="$(to_iptables_spec "${target_spec}")"
 
     if [[ "${target_spec}" == *-* ]]; then
-      target_destination="${WG_VPS2_IP}"
+      target_destination="${target_host}"
     else
-      target_destination="${WG_VPS2_IP}:${target_spec}"
+      target_destination="${target_host}:${target_spec}"
     fi
 
+    "${IPTABLES_BIN}" -t nat -A CAKESSH_SNAT -o "${WG_INTERFACE}" -p tcp -d "${target_host}" -j MASQUERADE
     "${IPTABLES_BIN}" -t nat -A CAKESSH_DNAT -p tcp -d "${VPS1_IPV4}" --dport "${listen_iptables_spec}" -j DNAT --to-destination "${target_destination}"
-    "${IPTABLES_BIN}" -t filter -A CAKESSH_FORWARD -o "${WG_INTERFACE}" -p tcp -d "${WG_VPS2_IP}" --dport "${target_iptables_spec}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+    "${IPTABLES_BIN}" -t filter -A CAKESSH_FORWARD -o "${WG_INTERFACE}" -p tcp -d "${target_host}" --dport "${target_iptables_spec}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
   done
 
   ensure_jump nat OUTPUT CAKESSH_DNAT
@@ -1525,7 +1809,7 @@ write_forwarder_config() {
     printf 'FORWARD_RULE_COUNT=%q\n' "${#FORWARD_RULE_NAMES[@]}"
 
     for index in "${!FORWARD_RULE_NAMES[@]}"; do
-      rule_value="${FORWARD_RULE_NAMES[$index]}|${FORWARD_RULE_LISTEN_SPECS[$index]}|${FORWARD_RULE_TARGET_SPECS[$index]}|${FORWARD_RULE_DESCRIPTIONS[$index]}"
+      rule_value="${FORWARD_RULE_NAMES[$index]}|${FORWARD_RULE_LISTEN_SPECS[$index]}|${FORWARD_RULE_TARGET_HOSTS[$index]}|${FORWARD_RULE_TARGET_SPECS[$index]}|${FORWARD_RULE_DESCRIPTIONS[$index]}"
       printf 'FORWARD_RULE_%s=%q\n' "$((index + 1))" "${rule_value}"
     done
   } > "$(forwarder_config_path)"
@@ -1638,6 +1922,8 @@ enable_relays() {
 
 forwarded_public_port_specs() {
   local wings_port=""
+  local peer_file=""
+  local SSH_PEER_PUBLIC_SSH_PORT=""
   local -a port_specs=()
 
   wings_port="$(calc_wings_port)"
@@ -1645,6 +1931,18 @@ forwarded_public_port_specs() {
   port_specs+=("${wings_port}")
   port_specs+=("2022")
   port_specs+=("${GAME_PORT_RANGE_LIST[@]}")
+
+  if [[ -d "$(ssh_peer_state_dir)" ]]; then
+    for peer_file in "$(ssh_peer_state_dir)"/*.env; do
+      [[ -f "${peer_file}" ]] || continue
+      SSH_PEER_PUBLIC_SSH_PORT=""
+      # shellcheck disable=SC1090
+      . "${peer_file}"
+      [[ -n "${SSH_PEER_PUBLIC_SSH_PORT}" ]] || continue
+      port_specs+=("${SSH_PEER_PUBLIC_SSH_PORT}")
+    done
+  fi
+
   printf '%s\n' "${port_specs[@]}"
 }
 
@@ -1729,7 +2027,7 @@ prompt_install_inputs() {
     detected_vps1_ipv4="$(detect_primary_ipv4 || true)"
   fi
 
-  if [[ "${ROLE}" == "client" || "${ROLE}" == "all" || "${ROLE}" == "vps1" || "${ROLE}" == "vps2" ]]; then
+  if [[ "${ROLE}" == "client" || "${ROLE}" == "all" || "${ROLE}" == "vps1" || "${ROLE}" == "vps2" || "${ROLE}" == "peer" || "${ROLE}" == "vps1-add-peer" ]]; then
     prompt_value VPS1_IPV4 "VPS1 public IPv4 address" "${detected_vps1_ipv4}"
   fi
 
@@ -1775,6 +2073,27 @@ prompt_install_inputs() {
     prompt_value WG_VPS2_ADDRESS "VPS2 WireGuard address" "${DEFAULT_WG_VPS2_ADDRESS}"
     prompt_value WG_VPS1_PUBLIC_KEY "VPS1 WireGuard public key (run: sudo bash install.sh show-key vps1 on VPS1)" ""
   fi
+
+  if [[ "${ROLE}" == "peer" ]]; then
+    prompt_value PEER_NAME "Peer name, for example vps3" "vps3"
+    prompt_value WG_INTERFACE "WireGuard interface name" "${DEFAULT_WG_INTERFACE}"
+    prompt_value WG_PORT "WireGuard UDP port on VPS1" "${DEFAULT_WG_PORT}"
+    prompt_value WG_VPS1_ADDRESS "VPS1 WireGuard address" "${DEFAULT_WG_VPS1_ADDRESS}"
+    prompt_value WG_PEER_ADDRESS "This peer WireGuard address" "${DEFAULT_WG_PEER_ADDRESS}"
+    prompt_value WG_VPS1_PUBLIC_KEY "VPS1 WireGuard public key (run: sudo bash install.sh show-key vps1 on VPS1)" ""
+  fi
+
+  if [[ "${ROLE}" == "vps1-add-peer" ]]; then
+    prompt_value PEER_NAME "Peer name, for example vps3" "vps3"
+    prompt_value PEER_USER "Peer SSH username" "${DEFAULT_PEER_USER}"
+    prompt_value PEER_SSH_PORT "Peer SSH port" "${DEFAULT_PEER_SSH_PORT}"
+    prompt_value PEER_PUBLIC_SSH_PORT "Public SSH port on VPS1 for this peer" "${DEFAULT_PEER_PUBLIC_SSH_PORT}"
+    prompt_value WG_INTERFACE "WireGuard interface name" "${DEFAULT_WG_INTERFACE}"
+    prompt_value WG_PORT "WireGuard UDP port on VPS1" "${DEFAULT_WG_PORT}"
+    prompt_value WG_VPS1_ADDRESS "VPS1 WireGuard address" "${DEFAULT_WG_VPS1_ADDRESS}"
+    prompt_value WG_PEER_ADDRESS "Peer WireGuard address" "${DEFAULT_WG_PEER_ADDRESS}"
+    prompt_value WG_PEER_PUBLIC_KEY "Peer WireGuard public key (run: sudo bash install.sh show-key peer on the peer)" ""
+  fi
 }
 
 prepare_relay_plan() {
@@ -1784,6 +2103,7 @@ prepare_relay_plan() {
 
   FORWARD_RULE_NAMES=()
   FORWARD_RULE_LISTEN_SPECS=()
+  FORWARD_RULE_TARGET_HOSTS=()
   FORWARD_RULE_TARGET_SPECS=()
   FORWARD_RULE_DESCRIPTIONS=()
   FORWARD_LISTEN_PORT_CHECKS=()
@@ -1800,6 +2120,31 @@ prepare_relay_plan() {
   for game_port_spec in "${GAME_PORT_RANGE_LIST[@]}"; do
     game_rule_name="game-${game_port_spec//[^0-9]/-}"
     add_forward_rule "${game_rule_name}" "${game_port_spec}" "${game_port_spec}" "Minecraft game ports over WireGuard"
+  done
+
+  add_extra_ssh_peer_forward_rules
+}
+
+add_extra_ssh_peer_forward_rules() {
+  local peer_file=""
+  local SSH_PEER_NAME=""
+  local SSH_PEER_WG_IP=""
+  local SSH_PEER_PUBLIC_SSH_PORT=""
+  local SSH_PEER_SSH_PORT=""
+
+  [[ -d "$(ssh_peer_state_dir)" ]] || return 0
+
+  for peer_file in "$(ssh_peer_state_dir)"/*.env; do
+    [[ -f "${peer_file}" ]] || continue
+    SSH_PEER_NAME=""
+    SSH_PEER_WG_IP=""
+    SSH_PEER_PUBLIC_SSH_PORT=""
+    SSH_PEER_SSH_PORT=""
+    # shellcheck disable=SC1090
+    . "${peer_file}"
+    [[ -n "${SSH_PEER_NAME}" && -n "${SSH_PEER_WG_IP}" && -n "${SSH_PEER_PUBLIC_SSH_PORT}" ]] || continue
+    SSH_PEER_SSH_PORT="${SSH_PEER_SSH_PORT:-22}"
+    add_forward_rule_to_host "${SSH_PEER_WG_IP}" "ssh-${SSH_PEER_NAME}" "${SSH_PEER_PUBLIC_SSH_PORT}" "${SSH_PEER_SSH_PORT}" "Direct SSH to ${SSH_PEER_NAME} over WireGuard"
   done
 }
 
@@ -1838,10 +2183,34 @@ validate_vps2_inputs() {
   [[ -n "${WG_VPS1_PUBLIC_KEY}" ]] || fail "VPS2 install needs the VPS1 public key. On VPS1 run: sudo bash install.sh show-key vps1"
 }
 
+validate_peer_inputs() {
+  apply_defaults
+  normalize_wireguard_addresses
+  validate_peer_name
+  validate_ipv4_basic "${VPS1_IPV4}"
+  ensure_local_wireguard_ip_available "${WG_PEER_IP}"
+  validate_port "${WG_PORT}"
+  validate_wireguard_public_key_if_present "${WG_VPS1_PUBLIC_KEY}"
+  [[ -n "${WG_VPS1_PUBLIC_KEY}" ]] || fail "Peer install needs the VPS1 public key. On VPS1 run: sudo bash install.sh show-key vps1"
+}
+
+validate_vps1_add_peer_inputs() {
+  apply_defaults
+  normalize_wireguard_addresses
+  validate_ipv4_basic "${VPS1_IPV4}"
+  validate_peer_name
+  validate_port "${PEER_SSH_PORT}"
+  validate_port "${PEER_PUBLIC_SSH_PORT}"
+  validate_port "${WG_PORT}"
+  validate_wireguard_public_key_if_present "${WG_PEER_PUBLIC_KEY}"
+  [[ -n "${WG_PEER_PUBLIC_KEY}" ]] || fail "VPS1 add-peer needs the peer public key. On the peer run: sudo bash install.sh show-key peer"
+}
+
 print_vps1_bootstrap_summary() {
   info ""
   info "VPS1 WireGuard bootstrap complete."
   info "Autostart enabled: $(wireguard_service_name)"
+  info "Watchdog timer: $(wireguard_watchdog_timer_name) (enabled after VPS2 key is added)"
   info ""
   info "Next steps:"
   info "  1. On VPS1, show the key when you need it:"
@@ -1866,6 +2235,7 @@ print_vps2_summary() {
   info ""
   info "VPS2 WireGuard install complete."
   info "Autostart enabled: $(wireguard_service_name)"
+  info "Watchdog timer: $(wireguard_watchdog_timer_name)"
   info ""
   info "Next steps:"
   info "  1. On VPS2, show the key:"
@@ -1891,6 +2261,12 @@ install_vps1() {
   generate_local_wireguard_keys "vps1"
   write_vps1_wireguard_config
   upsert_wireguard_service
+  if [[ -n "${WG_VPS2_PUBLIC_KEY}" ]]; then
+    write_wireguard_watchdog_script
+    write_wireguard_watchdog_config "${WG_VPS2_PUBLIC_KEY}"
+    write_wireguard_watchdog_unit
+    upsert_wireguard_watchdog
+  fi
   configure_wireguard_firewall
   save_install_state
 
@@ -1923,6 +2299,7 @@ install_vps1() {
   info "VPS1 forwarding install complete."
   info "WireGuard backend: ${WG_VPS2_IP} via ${WG_INTERFACE}"
   info "Autostart enabled: $(wireguard_service_name)"
+  info "Watchdog timer: $(wireguard_watchdog_timer_name)"
   info "Forwarder service: $(forwarder_service_name)"
   info "Direct SSH:"
   info "  ssh -p ${PUBLIC_SSH_FORWARD_PORT} ${VPS2_USER}@${VPS1_IPV4}"
@@ -1956,6 +2333,10 @@ install_vps2() {
 
   progress 3 4 "Enabling WireGuard autostart on VPS2"
   upsert_wireguard_service
+  write_wireguard_watchdog_script
+  write_wireguard_watchdog_config "${WG_VPS1_PUBLIC_KEY}"
+  write_wireguard_watchdog_unit
+  upsert_wireguard_watchdog
   configure_vps2_tunnel_firewall
   save_install_state
   progress 4 4 "VPS2 setup finished"
