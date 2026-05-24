@@ -124,7 +124,7 @@ Client extras:
   - creates SSH aliases `cakessh-vps2` and `cakessh-vps2-port`
 
 Optional flags:
-  --role client|vps1|vps2|all
+  --role client|vps1|vps2|peer|vps1-add-peer|all
   --mode install|remove|show-key
   --vps1-ipv4 203.0.113.10
   --vps1-user root
@@ -1999,12 +1999,12 @@ configure_wireguard_firewall() {
 
 configure_vps2_tunnel_firewall() {
   if ! command -v ufw >/dev/null 2>&1; then
-    warn "ufw is not installed. Make sure traffic from ${WG_VPS1_IP} to VPS2 is allowed on ${WG_INTERFACE} if another firewall is enabled."
+    warn "ufw is not installed. Make sure traffic from ${WG_VPS1_IP} is allowed on ${WG_INTERFACE} if another firewall is enabled."
     return 0
   fi
 
   if ! ufw status 2>/dev/null | grep -q '^Status: active'; then
-    warn "ufw is not active. Make sure traffic from ${WG_VPS1_IP} to VPS2 is allowed on ${WG_INTERFACE} if another firewall is enabled."
+    warn "ufw is not active. Make sure traffic from ${WG_VPS1_IP} is allowed on ${WG_INTERFACE} if another firewall is enabled."
     return 0
   fi
 
@@ -2199,9 +2199,13 @@ validate_vps1_add_peer_inputs() {
   normalize_wireguard_addresses
   validate_ipv4_basic "${VPS1_IPV4}"
   validate_peer_name
+  validate_port "${VPS2_SSH_PORT}"
+  validate_port "${PUBLIC_SSH_FORWARD_PORT}"
   validate_port "${PEER_SSH_PORT}"
   validate_port "${PEER_PUBLIC_SSH_PORT}"
   validate_port "${WG_PORT}"
+  validate_wings_scheme
+  normalize_game_ports
   validate_wireguard_public_key_if_present "${WG_PEER_PUBLIC_KEY}"
   [[ -n "${WG_PEER_PUBLIC_KEY}" ]] || fail "VPS1 add-peer needs the peer public key. On the peer run: sudo bash install.sh show-key peer"
 }
@@ -2244,6 +2248,20 @@ print_vps2_summary() {
   info "     sudo bash install.sh vps1"
   info "     Paste the VPS2 key when asked."
   info "     Your saved VPS1 settings will be reused automatically."
+}
+
+print_peer_summary() {
+  info ""
+  info "${PEER_NAME} WireGuard install complete."
+  info "Autostart enabled: $(wireguard_service_name)"
+  info "Watchdog timer: $(wireguard_watchdog_timer_name)"
+  info ""
+  info "Next steps:"
+  info "  1. On ${PEER_NAME}, show the key:"
+  info "     sudo bash install.sh show-key peer"
+  info "  2. Back on VPS1, run:"
+  info "     sudo bash install.sh vps1-add-peer --peer-name ${PEER_NAME} --wg-peer-address ${WG_PEER_ADDRESS}"
+  info "     Paste the peer key when asked."
 }
 
 install_vps1() {
@@ -2343,6 +2361,65 @@ install_vps2() {
   print_vps2_summary
 }
 
+install_peer() {
+  progress 1 4 "Preparing ${PEER_NAME}"
+  require_root
+  validate_peer_inputs
+  ensure_supported_linux
+  ensure_systemd
+
+  progress 2 4 "Installing WireGuard on ${PEER_NAME}"
+  ensure_wireguard_installed
+  generate_local_wireguard_keys "peer"
+  write_peer_wireguard_config
+
+  progress 3 4 "Enabling WireGuard autostart on ${PEER_NAME}"
+  upsert_wireguard_service
+  write_wireguard_watchdog_script
+  write_wireguard_watchdog_config "${WG_VPS1_PUBLIC_KEY}"
+  write_wireguard_watchdog_unit
+  upsert_wireguard_watchdog
+  configure_vps2_tunnel_firewall
+  save_install_state
+
+  progress 4 4 "${PEER_NAME} setup finished"
+  print_peer_summary
+}
+
+install_vps1_add_peer() {
+  progress 1 4 "Preparing VPS1 peer entry"
+  require_root
+  validate_vps1_add_peer_inputs
+  ensure_supported_linux
+  ensure_systemd
+
+  progress 2 4 "Adding ${PEER_NAME} to VPS1 WireGuard"
+  ensure_wireguard_installed
+  generate_local_wireguard_keys "vps1"
+  save_ssh_peer_state
+  write_vps1_wireguard_config
+  upsert_wireguard_service
+  configure_wireguard_firewall
+
+  progress 3 4 "Updating VPS1 TCP forwarder"
+  prepare_relay_plan
+  validate_vps1_relay_phase
+  ensure_iptables_installed
+  write_forwarder_runner
+  write_forwarder_unit
+  write_forwarder_config
+  systemctl daemon-reload
+  upsert_forwarder_service
+  configure_ufw
+  save_install_state
+
+  progress 4 4 "VPS1 peer entry finished"
+  info ""
+  info "Added ${PEER_NAME} to VPS1."
+  info "Direct SSH:"
+  info "  ssh -p ${PEER_PUBLIC_SSH_PORT} ${PEER_USER}@${VPS1_IPV4}"
+}
+
 remove_client() {
   determine_client_home
   local helper_target="${CLIENT_INSTALL_HOME}/.local/bin/cakessh"
@@ -2405,8 +2482,8 @@ show_public_key() {
 
   require_root
   case "${ROLE}" in
-    vps1|vps2) ;;
-    *) fail "show-key only supports vps1 or vps2." ;;
+    vps1|vps2|peer) ;;
+    *) fail "show-key only supports vps1, vps2, or peer." ;;
   esac
 
   apply_defaults
@@ -2417,11 +2494,17 @@ show_public_key() {
   info "${ROLE} WireGuard public key:"
   cat "${key_path}"
   info ""
-  if [[ "${ROLE}" == "vps1" ]]; then
-    info "Paste this into the VPS2 install when it asks for the VPS1 key."
-  else
-    info "Paste this into the VPS1 install when it asks for the VPS2 key."
-  fi
+  case "${ROLE}" in
+    vps1)
+      info "Paste this into the VPS2 or peer install when it asks for the VPS1 key."
+      ;;
+    vps2)
+      info "Paste this into the VPS1 install when it asks for the VPS2 key."
+      ;;
+    peer)
+      info "Paste this into the VPS1 add-peer install when it asks for the peer key."
+      ;;
+  esac
 }
 
 run_remove() {
@@ -2459,6 +2542,12 @@ run_install() {
       ;;
     vps2)
       install_vps2
+      ;;
+    peer)
+      install_peer
+      ;;
+    vps1-add-peer)
+      install_vps1_add_peer
       ;;
     all)
       validate_client_inputs
