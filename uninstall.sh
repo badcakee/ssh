@@ -14,25 +14,29 @@ print_help() {
 cakessh uninstall
 
 Usage:
-  bash uninstall.sh
   bash uninstall.sh client
   sudo bash uninstall.sh vps1
   sudo bash uninstall.sh vps2
   sudo bash uninstall.sh peer
   sudo bash uninstall.sh all
+
+Aliases:
+  vm1 = vps1, vm2 = vps2, vm3 = peer
 EOF
 }
 
 main() {
   [[ -f "${INSTALL_SCRIPT}" ]] || fail "install.sh not found next to uninstall.sh"
 
-  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-    print_help
-    exit 0
-  fi
+  case "${1:-}" in
+    -h|--help)
+      print_help
+      exit 0
+      ;;
+  esac
 
   if (($# == 0)); then
-    exec bash "${INSTALL_SCRIPT}" remove
+    exec bash "${INSTALL_SCRIPT}" remove vps1
   fi
 
   exec bash "${INSTALL_SCRIPT}" remove "$@"
